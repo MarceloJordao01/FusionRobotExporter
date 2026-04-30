@@ -1,0 +1,10 @@
+{
+    "autodeskProduct": "Fusion",
+    "type": "script",
+    "author": "koziasgenshin@gmail.com",
+    "description": {
+        "": "Export Fusion 360 designs to URDF/SDF for robotics simulation"
+    },
+    "supportedOS": "windows|mac",
+    "editEnabled": true
+}
