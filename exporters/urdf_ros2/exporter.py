@@ -13,6 +13,7 @@ from . import joint as Joint
 from . import link as Link
 from . import write
 from ...core import mesh as core_mesh
+from ...core import sensors as core_sensors
 
 
 def export(design, save_dir, options=None):
@@ -81,16 +82,23 @@ def export(design, save_dir, options=None):
 
         links_xyz_dict = {}
 
+        # Load sensors from JSON if available
+        sensors_file = options.get('sensors_file')
+        if not sensors_file:
+            sensors_file = core_sensors.find_sensors_file(save_dir)
+        sensors = core_sensors.load_sensors(sensors_file) if sensors_file else []
+
         # Generate URDF files
-        write.write_urdf(joints_dict, links_xyz_dict, inertial_dict, package_name, robot_name, save_dir)
+        write.write_urdf(joints_dict, links_xyz_dict, inertial_dict, package_name, robot_name, save_dir, sensors)
         write.write_materials_xacro(package_name, robot_name, save_dir)
         write.write_transmissions_xacro(joints_dict, links_xyz_dict, package_name, robot_name, save_dir)
-        write.write_gazebo_xacro(joints_dict, package_name, robot_name, save_dir)
+        write.write_gazebo_xacro(joints_dict, package_name, robot_name, save_dir, sensors)
 
-        # Generate launch files
+        # Generate launch files and RViz config
         if options.get('export_launch', True):
             write.write_display_launch(package_name, robot_name, save_dir)
             write.write_gazebo_launch(package_name, robot_name, save_dir)
+            write.write_display_rviz(package_name, robot_name, save_dir)
 
         # Generate ROS2 package files
         write.write_setup_py(package_name, save_dir)

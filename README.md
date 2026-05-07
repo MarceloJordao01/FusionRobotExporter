@@ -91,6 +91,84 @@ output_dir/
     └── *.obj
 ```
 
+## Sensores
+
+Sensores podem ser adicionados ao modelo exportado através de um arquivo `sensors.json`.
+Coloque o arquivo na pasta de destino antes de exportar, ou no diretório pai.
+
+### Exemplo: sensors.json
+
+```json
+{
+  "sensors": [
+    {
+      "name": "camera_front",
+      "type": "camera",
+      "parent_link": "base_link",
+      "pose": {
+        "xyz": [0.1, 0, 0.05],
+        "rpy": [0, 0, 0]
+      },
+      "params": {
+        "width": 640,
+        "height": 480,
+        "fov": 1.047,
+        "clip": {"near": 0.1, "far": 100.0}
+      }
+    },
+    {
+      "name": "lidar_top",
+      "type": "lidar",
+      "parent_link": "base_link",
+      "pose": {
+        "xyz": [0, 0, 0.15],
+        "rpy": [0, 0, 0]
+      },
+      "params": {
+        "samples": 360,
+        "range": {"min": 0.1, "max": 10.0}
+      }
+    },
+    {
+      "name": "imu",
+      "type": "imu",
+      "parent_link": "base_link",
+      "pose": {
+        "xyz": [0, 0, 0.02],
+        "rpy": [0, 0, 0]
+      }
+    }
+  ]
+}
+```
+
+### Tipos de Sensores
+
+| Tipo | Descrição | Parâmetros |
+|------|-----------|------------|
+| `camera` | Câmera RGB | width, height, fov, clip, update_rate |
+| `depth_camera` | Câmera de profundidade | width, height, fov, clip |
+| `lidar` | Sensor laser 2D (LiDAR) | samples, range, angle, resolution |
+| `imu` | Unidade de medição inercial | update_rate, noise |
+
+### Parâmetros de Câmera
+
+| Parâmetro | Descrição | Padrão |
+|-----------|-----------|--------|
+| `width` | Largura da imagem (pixels) | 640 |
+| `height` | Altura da imagem (pixels) | 480 |
+| `fov` | Campo de visão horizontal (radianos) | 1.047 (~60°) |
+| `clip.near` | Distância mínima visível (m) | 0.1 |
+| `clip.far` | Distância máxima visível (m) | 100.0 |
+| `update_rate` | Frequência de atualização (Hz) | 30.0 |
+
+### Parâmetros de Pose
+
+- `xyz`: posição [x, y, z] em metros, relativa ao `parent_link`
+- `rpy`: orientação [roll, pitch, yaw] em radianos
+
+Um arquivo de exemplo está disponível em `sensors.example.json`.
+
 ## Requisitos do Modelo Fusion 360
 
 - Cada **link** deve ser um **componente separado**
@@ -112,8 +190,10 @@ output_dir/
 FusionRobotExporter/
 ├── FusionRobotExporter.py    # Entry point + UI
 ├── FusionRobotExporter.manifest
+├── sensors.example.json      # Exemplo de configuração de sensores
 ├── core/
-│   └── mesh.py               # Exportação STL/OBJ compartilhada
+│   ├── mesh.py               # Exportação STL/OBJ compartilhada
+│   └── sensors.py            # Carregamento e geração de sensores
 └── exporters/
     ├── urdf_ros1/            # Exportador ROS1
     ├── urdf_ros2/            # Exportador ROS2

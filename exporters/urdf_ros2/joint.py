@@ -139,7 +139,7 @@ def make_joints_dict(root, msg, base_link_name=None):
         if is_parent_base:
             joint_dict['parent'] = 'base_link'
         else:
-            joint_dict['parent'] = re.sub('[ :()]', '_', joint.occurrenceTwo.name)
+            joint_dict['parent'] = utils.normalize_name(joint.occurrenceTwo.name)
 
         # Check if child is base_link
         is_child_base = (base_link_name and joint.occurrenceOne.name == base_link_name) or \
@@ -148,7 +148,7 @@ def make_joints_dict(root, msg, base_link_name=None):
         if is_child_base:
             joint_dict['child'] = 'base_link'
         else:
-            joint_dict['child'] = re.sub('[ :()]', '_', joint.occurrenceOne.name)
+            joint_dict['child'] = utils.normalize_name(joint.occurrenceOne.name)
 
         def trans(M, a):
             ex = [M[0], M[4], M[8]]
@@ -190,6 +190,6 @@ def make_joints_dict(root, msg, base_link_name=None):
                 msg = joint.name + " doesn't have joint origin."
                 break
 
-        joints_dict[joint.name] = joint_dict
+        joints_dict[utils.normalize_name(joint.name)] = joint_dict
 
     return joints_dict, msg

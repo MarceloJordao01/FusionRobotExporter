@@ -1,0 +1,76 @@
+{
+  "sensors": [
+    {
+      "name": "camera_front",
+      "type": "camera",
+      "parent_link": "base_link",
+      "pose": {
+        "xyz": [0.1, 0, 0.05],
+        "rpy": [0, 0, 0]
+      },
+      "params": {
+        "update_rate": 30.0,
+        "width": 640,
+        "height": 480,
+        "fov": 1.047,
+        "clip": {
+          "near": 0.1,
+          "far": 100.0
+        }
+      }
+    },
+    {
+      "name": "depth_camera",
+      "type": "depth_camera",
+      "parent_link": "base_link",
+      "pose": {
+        "xyz": [0.12, 0, 0.05],
+        "rpy": [0, 0, 0]
+      },
+      "params": {
+        "update_rate": 30.0,
+        "width": 640,
+        "height": 480,
+        "fov": 1.047,
+        "clip": {
+          "near": 0.1,
+          "far": 10.0
+        }
+      }
+    },
+    {
+      "name": "lidar_top",
+      "type": "lidar",
+      "parent_link": "base_link",
+      "pose": {
+        "xyz": [0, 0, 0.15],
+        "rpy": [0, 0, 0]
+      },
+      "params": {
+        "update_rate": 10.0,
+        "samples": 360,
+        "resolution": 1.0,
+        "range": {
+          "min": 0.1,
+          "max": 10.0
+        },
+        "angle": {
+          "min": -3.14159,
+          "max": 3.14159
+        }
+      }
+    },
+    {
+      "name": "imu",
+      "type": "imu",
+      "parent_link": "base_link",
+      "pose": {
+        "xyz": [0, 0, 0.02],
+        "rpy": [0, 0, 0]
+      },
+      "params": {
+        "update_rate": 100.0
+      }
+    }
+  ]
+}

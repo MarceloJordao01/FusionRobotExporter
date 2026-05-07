@@ -20,12 +20,14 @@ from .link import Link, LinkElement, LinkElementType, LinkGeometry, LinkGeometry
 from .joint import Joint, JointType
 from .pose import Pose
 from ...core.mesh import export_body_to_obj
+from ...core import sensors as core_sensors
 
 
 class SDF:
-    def __init__(self, design: adsk.fusion.Design, meshes_cache_dir_path: Path = None):
+    def __init__(self, design: adsk.fusion.Design, meshes_cache_dir_path: Path = None, sensors: List = None):
         self.design = design
         self.meshes_cache_dir_path = meshes_cache_dir_path
+        self.sensors = sensors or []
         self.tmp_dir_path: Path = Path(tempfile.mkdtemp())
         self.tmp_meshes_dir_path: Path = self.tmp_dir_path / 'meshes'
         self.name: str = None
@@ -135,8 +137,10 @@ class SDF:
             visual = LinkElement(LinkElementType.VISUAL, link.name + '__' + normalize_name(body.name) + '_visual')
             visual.geometry = LinkGeometry(LinkGeometryType.MESH)
             visual.geometry.mesh_uri = 'meshes/' + name_to_path(visual.name) + '.obj'
-            if rigid_group_pose is not None:
-                visual.pose = rigid_group_pose
+            # Visual pose is relative to link frame
+            # Since meshes are exported in component-local coords, and link.pose = occurrence.transform2,
+            # visual should have identity pose (mesh origin = link origin)
+            visual.pose = None
             mesh_path = self.tmp_dir_path / visual.geometry.mesh_uri
             link.visuals[visual.name] = visual
 
@@ -156,9 +160,11 @@ class SDF:
                 obb = body.orientedMinimumBoundingBox
                 obb_matrix3d = adsk.core.Matrix3D.create()
                 obb_matrix3d.setWithCoordinateSystem(obb.centerPoint, obb.heightDirection, obb.widthDirection, obb.lengthDirection)
-                collision.pose = Pose(cm_to_m(obb.centerPoint.asArray()), matrix3d_to_rpy(obb_matrix3d))
-                if rigid_group_pose is not None:
-                    collision.pose = rigid_group_pose * collision.pose
+                # OBB centerPoint is in component-local coords, transform to link-relative
+                # Since link.pose = occurrence.transform2, we need inverse
+                obb_pose_global = Pose(cm_to_m(obb.centerPoint.asArray()), matrix3d_to_rpy(obb_matrix3d))
+                collision.pose = link.pose.inverse() * obb_pose_global
+                collision.pose.relative_to = None
                 collision.geometry = LinkGeometry(LinkGeometryType.BOX)
                 collision.geometry.size = [cm_to_m(obb.height), cm_to_m(obb.width), cm_to_m(obb.length)]
             link.collisions[collision.name] = collision
@@ -311,17 +317,30 @@ class SDF:
         model_node = ET.SubElement(sdf_node, 'model', {'name': self.name})
 
         if self.root_link is not None:
-            self.links[self.root_link].to_sdf_element(model_node)
+            link_node = self.links[self.root_link].to_sdf_element(model_node)
+            self._add_sensors_to_link(link_node, self.root_link)
 
         for link in self.links.values():
             if link.name == self.root_link:
                 continue
-            link.to_sdf_element(model_node)
+            link_node = link.to_sdf_element(model_node)
+            self._add_sensors_to_link(link_node, link.name)
 
         for joint in self.joints.values():
             joint.to_sdf_element(model_node)
 
         return ET.tostring(sdf_node)
+
+    def _add_sensors_to_link(self, link_node, link_name):
+        """Add sensors to a link element"""
+        if not self.sensors:
+            return
+
+        sensors_xml = core_sensors.generate_sensors_for_link_sdf(self.sensors, link_name, indent='')
+        if sensors_xml:
+            sensors_fragment = ET.fromstring(f'<root>{sensors_xml}</root>')
+            for sensor_elem in sensors_fragment:
+                link_node.append(sensor_elem)
 
     def save(self, path: Path):
         log(f'Saving SDF to "{path}"\n')

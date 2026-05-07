@@ -1,7 +1,7 @@
 {
     "autodeskProduct": "Fusion",
     "type": "script",
-    "author": "koziasgenshin@gmail.com",
+    "author": "Marcelo Ramos <marcelo.jordao@discente.ufg.br>",
     "description": {
         "": "Export Fusion 360 designs to URDF/SDF for robotics simulation"
     },

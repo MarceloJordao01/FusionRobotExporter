@@ -11,8 +11,22 @@ import re
 
 
 def normalize_name(name: str) -> str:
-    """Normalize component name for file system"""
-    return re.sub(r'[ :()\\/<>"|?*]', '_', name)
+    """
+    Normalize component/occurrence name for file system and URDF compatibility.
+    Must match the normalization used in urdf_ros2/utils.py for consistency.
+    """
+    import unicodedata
+    # Normalize unicode to decomposed form (separate base char from accent)
+    normalized = unicodedata.normalize('NFKD', name)
+    # Remove accents (combining characters)
+    ascii_name = ''.join(c for c in normalized if not unicodedata.combining(c))
+    # Replace spaces and special characters with underscore
+    ascii_name = re.sub(r'[^a-zA-Z0-9_]', '_', ascii_name)
+    # Remove multiple consecutive underscores
+    ascii_name = re.sub(r'_+', '_', ascii_name)
+    # Remove leading/trailing underscores
+    ascii_name = ascii_name.strip('_')
+    return ascii_name
 
 
 def get_all_occurrences(root: adsk.fusion.Component):
@@ -57,7 +71,7 @@ def get_bodies_from_occurrence(occ: adsk.fusion.Occurrence):
 
 def export_stl(design: adsk.fusion.Design, save_dir: str, occurrences=None, prefix_names=False, base_link_name=None):
     """
-    Export STL files for all occurrences
+    Export STL files for all occurrences directly (no temporary components).
 
     Parameters
     ----------
@@ -83,25 +97,26 @@ def export_stl(design: adsk.fusion.Design, save_dir: str, occurrences=None, pref
     errors = []
 
     for occ, prefix in occurrences:
+        occ_name = normalize_name(occ.name)
         comp_name = normalize_name(occ.component.name)
 
-        if comp_name in exported or 'old_component' in comp_name:
+        if occ_name in exported:
             continue
 
         bodies, source = get_bodies_from_occurrence(occ)
 
         if bodies is None or bodies.count == 0:
             if occ.childOccurrences.count == 0:
-                errors.append(f"{comp_name}: no bodies found")
+                errors.append(f"{occ_name}: no bodies found")
             continue
 
-        # Check if this is the base_link
+        # Determine the file name
         if base_link_name and occ.name == base_link_name:
             file_name = 'base_link'
-        elif prefix_names and prefix:
-            file_name = prefix + comp_name
+        elif comp_name == 'base_link':
+            file_name = 'base_link'
         else:
-            file_name = comp_name
+            file_name = occ_name
 
         file_path = os.path.join(meshes_dir, file_name + '.stl')
 
@@ -114,11 +129,11 @@ def export_stl(design: adsk.fusion.Design, save_dir: str, occurrences=None, pref
             stl_options.meshRefinement = adsk.fusion.MeshRefinementSettings.MeshRefinementLow
 
             if export_mgr.execute(stl_options):
-                exported[comp_name] = file_path
+                exported[file_name] = file_path
             else:
-                errors.append(f"{comp_name}: export failed")
+                errors.append(f"{file_name}: export failed")
         except Exception as e:
-            errors.append(f"{comp_name}: {str(e)}")
+            errors.append(f"{file_name}: {str(e)}")
 
     return exported, errors
 

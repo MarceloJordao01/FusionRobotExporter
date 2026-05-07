@@ -87,12 +87,12 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
 
             if design:
                 root = design.rootComponent
+
+                # Populate dropdown - first occurrence is selected by default
                 first = True
                 for occ in root.allOccurrences:
-                    is_base = occ.component.name == 'base_link'
-                    base_link_dropdown.listItems.add(occ.name, is_base or first)
-                    if is_base or first:
-                        first = False
+                    base_link_dropdown.listItems.add(occ.name, first)
+                    first = False
 
             # --- Export Options ---
             options_group = inputs.addGroupCommandInput('options_group', 'Export Options')
@@ -123,6 +123,14 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
             collision_type.listItems.add('Mesh', True)
             collision_type.listItems.add('Bounding Box', False)
             collision_type.listItems.add('Simplified', False)
+
+            # --- Sensors Configuration ---
+            sensors_group = inputs.addGroupCommandInput('sensors_group', 'Sensors Configuration')
+            sensors_group_children = sensors_group.children
+
+            sensors_group_children.addBoolValueInput('include_sensors', 'Include Sensors', True, '', False)
+            sensors_group_children.addStringValueInput('sensors_file', 'Sensors File', '')
+            sensors_group_children.addBoolValueInput('sensors_browse', 'Browse...', False)
 
             # --- Event handlers ---
             on_execute = CommandExecuteHandler()
@@ -170,6 +178,26 @@ class CommandInputChangedHandler(adsk.core.InputChangedEventHandler):
                 else:
                     mesh_format.listItems.item(0).isSelected = True  # STL for URDF
 
+            # Handle sensors browse button
+            if changed_input.id == 'sensors_browse' and changed_input.value:
+                app = adsk.core.Application.get()
+                ui = app.userInterface
+
+                file_dialog = ui.createFileDialog()
+                file_dialog.title = 'Select Sensors JSON File'
+                file_dialog.filter = 'JSON Files (*.json);;All Files (*.*)'
+                file_dialog.filterIndex = 0
+
+                result = file_dialog.showOpen()
+                if result == adsk.core.DialogResults.DialogOK:
+                    sensors_file_input = inputs.itemById('sensors_file')
+                    sensors_file_input.value = file_dialog.filename
+                    include_sensors = inputs.itemById('include_sensors')
+                    include_sensors.value = True
+
+                # Reset button state
+                changed_input.value = False
+
         except:
             pass
 
@@ -201,6 +229,8 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
             export_launch = inputs.itemById('export_launch').value
             mesh_format = inputs.itemById('mesh_format').selectedItem.name
             collision_type = inputs.itemById('collision_type').selectedItem.name
+            include_sensors = inputs.itemById('include_sensors').value
+            sensors_file = inputs.itemById('sensors_file').value
 
             # Ask for save location
             folder_dialog = ui.createFolderDialog()
@@ -221,6 +251,8 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                 'export_launch': export_launch,
                 'mesh_format': mesh_format,
                 'collision_type': collision_type,
+                'include_sensors': include_sensors,
+                'sensors_file': sensors_file,
             }
 
             # Call appropriate exporter

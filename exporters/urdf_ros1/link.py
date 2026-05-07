@@ -11,7 +11,7 @@ from . import utils
 
 
 class Link:
-    def __init__(self, name, xyz, center_of_mass, repo, mass, inertia_tensor):
+    def __init__(self, name, xyz, center_of_mass, repo, mass, inertia_tensor, rpy=None):
         """
         Parameters
         ----------
@@ -21,9 +21,11 @@ class Link:
         repo: str - repository path for meshes
         mass: float - mass of the link
         inertia_tensor: [ixx, iyy, izz, ixy, iyz, ixz]
+        rpy: [roll, pitch, yaw] - rotation for visual and collision (optional)
         """
         self.name = name
         self.xyz = [-_ for _ in xyz]  # reverse sign
+        self.rpy = [-_ for _ in rpy] if rpy else [0, 0, 0]  # reverse sign
         self.center_of_mass = center_of_mass
         self.link_xml = None
         self.repo = repo
@@ -52,9 +54,10 @@ class Link:
         }
 
         # Visual
+        # Mesh is exported directly from occurrence (local coordinates)
         visual = SubElement(link, 'visual')
         origin_v = SubElement(visual, 'origin')
-        origin_v.attrib = {'xyz': ' '.join([str(_) for _ in self.xyz]), 'rpy': '0 0 0'}
+        origin_v.attrib = {'xyz': '0 0 0', 'rpy': '0 0 0'}
         geometry_v = SubElement(visual, 'geometry')
         mesh_v = SubElement(geometry_v, 'mesh')
         mesh_v.attrib = {
@@ -67,7 +70,7 @@ class Link:
         # Collision
         collision = SubElement(link, 'collision')
         origin_c = SubElement(collision, 'origin')
-        origin_c.attrib = {'xyz': ' '.join([str(_) for _ in self.xyz]), 'rpy': '0 0 0'}
+        origin_c.attrib = {'xyz': '0 0 0', 'rpy': '0 0 0'}
         geometry_c = SubElement(collision, 'geometry')
         mesh_c = SubElement(geometry_c, 'mesh')
         mesh_c.attrib = {
@@ -90,7 +93,7 @@ def make_inertial_dict(root, msg, base_link_name=None):
 
     Returns
     ----------
-    inertial_dict: {name: {mass, inertia, center_of_mass}}
+    inertial_dict: {name: {mass, inertia, center_of_mass, xyz, rpy}}
     msg: str - Status message
     """
     inertial_dict = {}
@@ -105,7 +108,7 @@ def make_inertial_dict(root, msg, base_link_name=None):
             occs_dict = {}
             prop = occs.getPhysicalProperties(adsk.fusion.CalculationAccuracy.VeryHighCalculationAccuracy)
 
-            occs_dict['name'] = re.sub('[ :()]', '_', occs.name)
+            occs_dict['name'] = utils.normalize_name(occs.name)
 
             mass = prop.mass  # kg
             occs_dict['mass'] = mass
@@ -116,6 +119,11 @@ def make_inertial_dict(root, msg, base_link_name=None):
             moment_inertia_world = [_ / 10000.0 for _ in [xx, yy, zz, xy, yz, xz]]  # kg/cm^2 -> kg/m^2
             occs_dict['inertia'] = utils.origin2center_of_mass(moment_inertia_world, center_of_mass, mass)
 
+            # Extract transform (xyz and rpy) from occurrence
+            xyz, rpy = utils.get_occurrence_transform(occs)
+            occs_dict['xyz'] = xyz
+            occs_dict['rpy'] = rpy
+
             # Check if this is the base_link
             is_base = (base_link_name and occs.name == base_link_name) or \
                       (not base_link_name and occs.component.name == 'base_link')
@@ -123,7 +131,7 @@ def make_inertial_dict(root, msg, base_link_name=None):
             if is_base:
                 inertial_dict['base_link'] = occs_dict
             else:
-                inertial_dict[re.sub('[ :()]', '_', occs.name)] = occs_dict
+                inertial_dict[utils.normalize_name(occs.name)] = occs_dict
 
             # Process child occurrences (subassemblies)
             if occs.childOccurrences.count > 0:

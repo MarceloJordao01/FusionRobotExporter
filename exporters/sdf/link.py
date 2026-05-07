@@ -124,3 +124,5 @@ class Link:
 
         for collision in self.collisions.values():
             collision.to_sdf_element(link_node)
+
+        return link_node

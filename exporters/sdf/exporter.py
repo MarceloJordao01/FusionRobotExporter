@@ -11,6 +11,7 @@ from pathlib import Path
 
 from .log import set_log_console, log
 from .sdf import SDF
+from ...core import sensors as core_sensors
 
 
 def export(design, save_dir, options=None):
@@ -60,8 +61,16 @@ def export(design, save_dir, options=None):
         else:
             meshes_cache_path = None
 
+        # Load sensors from JSON if available
+        sensors_file = options.get('sensors_file')
+        if not sensors_file:
+            sensors_file = core_sensors.find_sensors_file(str(sdf_dir_path))
+        sensors = core_sensors.load_sensors(sensors_file) if sensors_file else []
+        if sensors:
+            log(f'Loaded {len(sensors)} sensors from "{sensors_file}"\n')
+
         # Generate SDF
-        sdf = SDF(design, meshes_cache_path)
+        sdf = SDF(design, meshes_cache_path, sensors)
         sdf.print()
         sdf.save(sdf_dir_path)
 

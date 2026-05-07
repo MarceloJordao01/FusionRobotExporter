@@ -9,11 +9,31 @@ import adsk.core
 import adsk.fusion
 import os.path
 import re
+import math
+import unicodedata
 from xml.etree import ElementTree
 from xml.dom import minidom
 import shutil
 import fileinput
 import sys
+
+
+def normalize_name(name):
+    """
+    Normalize a name for URDF compatibility.
+    Removes accents, replaces spaces and special characters with underscores.
+    """
+    # Normalize unicode to decomposed form (separate base char from accent)
+    normalized = unicodedata.normalize('NFKD', name)
+    # Remove accents (combining characters)
+    ascii_name = ''.join(c for c in normalized if not unicodedata.combining(c))
+    # Replace spaces and special characters with underscore
+    ascii_name = re.sub(r'[^a-zA-Z0-9_]', '_', ascii_name)
+    # Remove multiple consecutive underscores
+    ascii_name = re.sub(r'_+', '_', ascii_name)
+    # Remove leading/trailing underscores
+    ascii_name = ascii_name.strip('_')
+    return ascii_name
 
 
 def copy_occs(root):
@@ -29,7 +49,7 @@ def copy_occs(root):
             occs.component.name = 'old_component'
             new_occs.component.name = 'base_link'
         else:
-            new_occs.component.name = re.sub('[ :()]', '_', occs.name)
+            new_occs.component.name = normalize_name(occs.name)
         new_occs = allOccs.item((allOccs.count - 1))
         for i in range(bodies.count):
             body = bodies.item(i)
@@ -165,3 +185,42 @@ def update_package_xml(save_dir, package_name):
             sys.stdout.write("<description>The " + package_name + " package</description>\n")
         else:
             sys.stdout.write(line)
+
+
+def matrix3d_to_rpy(matrix3d):
+    """
+    Convert a Fusion 360 Matrix3D to roll, pitch, yaw angles.
+    Returns [roll, pitch, yaw] in radians.
+    """
+    R = [[0, 0, 0], [0, 0, 0], [0, 0, 0]]
+    for row in range(3):
+        for col in range(3):
+            R[row][col] = matrix3d.getCell(row, col)
+
+    sy = math.sqrt(R[0][0] ** 2 + R[1][0] ** 2)
+    singular = sy < 1e-6
+
+    if not singular:
+        roll = math.atan2(R[2][1], R[2][2])
+        pitch = math.atan2(-R[2][0], sy)
+        yaw = math.atan2(R[1][0], R[0][0])
+    else:
+        roll = math.atan2(-R[1][2], R[1][1])
+        pitch = math.atan2(-R[2][0], sy)
+        yaw = 0
+
+    return [round(roll, 6), round(pitch, 6), round(yaw, 6)]
+
+
+def get_occurrence_transform(occurrence):
+    """
+    Get the xyz position and rpy rotation from an occurrence's transform.
+    Returns (xyz, rpy) where both are lists of 3 floats.
+    xyz is in meters, rpy is in radians.
+    """
+    transform = occurrence.transform
+
+    xyz = [round(v / 100.0, 6) for v in transform.translation.asArray()]
+    rpy = matrix3d_to_rpy(transform)
+
+    return xyz, rpy

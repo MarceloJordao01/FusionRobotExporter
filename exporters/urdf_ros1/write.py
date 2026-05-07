@@ -10,9 +10,10 @@ from xml.etree.ElementTree import Element, SubElement
 from . import link as Link
 from . import joint as Joint
 from . import utils
+from ...core import sensors as core_sensors
 
 
-def write_link_urdf(joints_dict, repo, links_xyz_dict, file_name, inertial_dict):
+def write_link_urdf(joints_dict, repo, links_xyz_dict, links_rpy_dict, file_name, inertial_dict):
     """Write links information into URDF file"""
     with open(file_name, mode='a') as f:
         # Base link
@@ -23,9 +24,11 @@ def write_link_urdf(joints_dict, repo, links_xyz_dict, file_name, inertial_dict)
             center_of_mass=center_of_mass,
             repo=repo,
             mass=inertial_dict['base_link']['mass'],
-            inertia_tensor=inertial_dict['base_link']['inertia']
+            inertia_tensor=inertial_dict['base_link']['inertia'],
+            rpy=[0, 0, 0]
         )
         links_xyz_dict[link.name] = link.xyz
+        links_rpy_dict[link.name] = link.rpy
         link.make_link_xml()
         f.write(link.link_xml)
         f.write('\n')
@@ -39,15 +42,19 @@ def write_link_urdf(joints_dict, repo, links_xyz_dict, file_name, inertial_dict)
                     joints_dict[joint]['xyz']
                 )
             ]
+            # Get rpy from inertial_dict (extracted from occurrence transform)
+            rpy = inertial_dict[name].get('rpy', [0, 0, 0])
             link = Link.Link(
                 name=name,
                 xyz=joints_dict[joint]['xyz'],
                 center_of_mass=center_of_mass,
                 repo=repo,
                 mass=inertial_dict[name]['mass'],
-                inertia_tensor=inertial_dict[name]['inertia']
+                inertia_tensor=inertial_dict[name]['inertia'],
+                rpy=rpy
             )
             links_xyz_dict[link.name] = link.xyz
+            links_rpy_dict[link.name] = link.rpy
             link.make_link_xml()
             f.write(link.link_xml)
             f.write('\n')
@@ -93,8 +100,11 @@ def write_joint_urdf(joints_dict, repo, links_xyz_dict, file_name):
             f.write('\n')
 
 
-def write_urdf(joints_dict, links_xyz_dict, inertial_dict, package_name, robot_name, save_dir):
+def write_urdf(joints_dict, links_xyz_dict, inertial_dict, package_name, robot_name, save_dir, sensors=None):
     """Write main URDF/XACRO file"""
+    sensors = sensors or []
+    links_rpy_dict = {}
+
     try:
         os.mkdir(save_dir + '/urdf')
     except:
@@ -112,10 +122,14 @@ def write_urdf(joints_dict, links_xyz_dict, inertial_dict, package_name, robot_n
         f.write(f'<xacro:include filename="$(find {package_name})/urdf/{robot_name}.gazebo" />\n')
         f.write('\n')
 
-    write_link_urdf(joints_dict, repo, links_xyz_dict, file_name, inertial_dict)
+    write_link_urdf(joints_dict, repo, links_xyz_dict, links_rpy_dict, file_name, inertial_dict)
     write_joint_urdf(joints_dict, repo, links_xyz_dict, file_name)
 
     with open(file_name, mode='a') as f:
+        # Write sensor links and joints
+        if sensors:
+            f.write(core_sensors.generate_sensors_urdf(sensors))
+
         f.write('</robot>\n')
 
 
@@ -181,8 +195,10 @@ def write_transmissions_xacro(joints_dict, links_xyz_dict, package_name, robot_n
         f.write('</robot>\n')
 
 
-def write_gazebo_xacro(joints_dict, package_name, robot_name, save_dir):
+def write_gazebo_xacro(joints_dict, package_name, robot_name, save_dir, sensors=None):
     """Write Gazebo XACRO file"""
+    sensors = sensors or []
+
     try:
         os.mkdir(save_dir + '/urdf')
     except:
@@ -224,6 +240,10 @@ def write_gazebo_xacro(joints_dict, package_name, robot_name, save_dir):
             f.write('  <selfCollide>true</selfCollide>\n')
             f.write('</gazebo>\n')
             f.write('\n')
+
+        # Sensor plugins
+        if sensors:
+            f.write(core_sensors.generate_sensors_gazebo_urdf(sensors))
 
         f.write('</robot>\n')
 
@@ -403,3 +423,120 @@ def write_controller_yaml(robot_name, save_dir, joints_dict):
                 f.write('    type: effort_controllers/JointPositionController\n')
                 f.write(f'    joint: {joint}\n')
                 f.write('    pid: {p: 100.0, i: 0.01, d: 10.0}\n')
+
+
+def write_display_rviz(package_name, robot_name, save_dir):
+    """Write RViz configuration file for ROS1"""
+    try:
+        os.mkdir(save_dir + '/launch')
+    except:
+        pass
+
+    file_name = os.path.join(save_dir, 'launch', 'urdf.rviz')
+
+    content = '''Panels:
+  - Class: rviz/Displays
+    Name: Displays
+  - Class: rviz/Views
+    Name: Views
+
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Alpha: 0.5
+      Cell Size: 1
+      Class: rviz/Grid
+      Color: 160; 160; 164
+      Enabled: true
+      Line Style:
+        Line Width: 0.03
+        Value: Lines
+      Name: Grid
+      Normal Cell Count: 0
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Plane: XY
+      Plane Cell Count: 10
+      Reference Frame: <Fixed Frame>
+      Value: true
+    - Alpha: 1
+      Class: rviz/RobotModel
+      Collision Enabled: false
+      Enabled: true
+      Links:
+        All Links Enabled: true
+        Expand Joint Details: false
+        Expand Link Details: false
+        Expand Tree: false
+        Link Tree Style: Links in Alphabetic Order
+      Name: RobotModel
+      Robot Description: robot_description
+      TF Prefix: ""
+      Update Interval: 0
+      Value: true
+      Visual Enabled: true
+    - Class: rviz/TF
+      Enabled: true
+      Frame Timeout: 15
+      Frames:
+        All Enabled: true
+      Marker Scale: 0.3
+      Name: TF
+      Show Arrows: true
+      Show Axes: true
+      Show Names: true
+      Update Interval: 0
+      Value: true
+  Enabled: true
+  Global Options:
+    Background Color: 48; 48; 48
+    Fixed Frame: base_link
+    Frame Rate: 30
+  Name: root
+  Tools:
+    - Class: rviz/Interact
+      Hide Inactive Objects: true
+    - Class: rviz/MoveCamera
+    - Class: rviz/Select
+    - Class: rviz/FocusCamera
+    - Class: rviz/Measure
+      Line color: 128; 128; 0
+  Value: true
+  Views:
+    Current:
+      Class: rviz/Orbit
+      Distance: 2
+      Enable Stereo Rendering:
+        Stereo Eye Separation: 0.06
+        Stereo Focal Distance: 1
+        Swap Stereo Eyes: false
+        Value: false
+      Focal Point:
+        X: 0
+        Y: 0
+        Z: 0
+      Focal Shape Fixed Size: true
+      Focal Shape Size: 0.05
+      Invert Z Axis: false
+      Name: Current View
+      Near Clip Distance: 0.01
+      Pitch: 0.5
+      Target Frame: <Fixed Frame>
+      Value: Orbit (rviz)
+      Yaw: 0.785
+    Saved: ~
+Window Geometry:
+  Displays:
+    collapsed: false
+  Height: 846
+  Hide Left Dock: false
+  Hide Right Dock: false
+  Width: 1200
+  X: 65
+  Y: 24
+'''
+
+    with open(file_name, mode='w') as f:
+        f.write(content)

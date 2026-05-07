@@ -1,8 +1,8 @@
-# Generic deploy script for Fusion 360 Scripts
-# Automatically detects project name from folder
+# Deploy script for FusionRobotExporter
+# Installs to Fusion 360 Scripts folder
 
 $SourcePath = $PSScriptRoot
-$ProjectName = Split-Path -Leaf $SourcePath
+$ProjectName = "FusionRobotExporter"
 $FusionAPIPath = "$env:APPDATA\Autodesk\Autodesk Fusion 360\API\Scripts"
 $DestinationPath = Join-Path $FusionAPIPath $ProjectName
 
