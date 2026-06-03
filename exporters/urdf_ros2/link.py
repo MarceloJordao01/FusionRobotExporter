@@ -43,7 +43,8 @@ class Link:
         }
 
         # Visual
-        # Mesh is exported directly from occurrence (local coordinates)
+        # The STL is exported per-occurrence in the component's LOCAL coordinates,
+        # so the mesh is already aligned with the link frame: origin stays 0.
         visual = SubElement(link, 'visual')
         origin_v = SubElement(visual, 'origin')
         origin_v.attrib = {'xyz': '0 0 0', 'rpy': '0 0 0'}
@@ -86,12 +87,16 @@ def make_inertial_dict(root, msg, base_link_name=None):
 
             occs_dict['name'] = utils.normalize_name(occs.name)
             occs_dict['mass'] = prop.mass
-            center_of_mass = [_ / 100.0 for _ in prop.centerOfMass.asArray()]
-            occs_dict['center_of_mass'] = center_of_mass
+
+            # World COM (m) for the parallel-axis shift of the world-aligned
+            # inertia tensor; LOCAL-frame COM for the URDF <inertial><origin>.
+            world_com_m = [_ / 100.0 for _ in prop.centerOfMass.asArray()]
+            occs_dict['center_of_mass'] = utils.world_point_to_link(
+                occs.transform, prop.centerOfMass.asArray())
 
             (_, xx, yy, zz, xy, yz, xz) = prop.getXYZMomentsOfInertia()
             moment_inertia_world = [_ / 10000.0 for _ in [xx, yy, zz, xy, yz, xz]]
-            occs_dict['inertia'] = utils.origin2center_of_mass(moment_inertia_world, center_of_mass, prop.mass)
+            occs_dict['inertia'] = utils.origin2center_of_mass(moment_inertia_world, world_com_m, prop.mass)
 
             # Extract transform (xyz and rpy) from occurrence
             xyz, rpy = utils.get_occurrence_transform(occs)

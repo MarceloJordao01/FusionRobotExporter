@@ -11,10 +11,11 @@ from . import utils
 
 
 class Joint:
-    def __init__(self, name, xyz, axis, parent, child, joint_type, upper_limit, lower_limit):
+    def __init__(self, name, xyz, axis, parent, child, joint_type, upper_limit, lower_limit, rpy=None):
         self.name = name
         self.type = joint_type
         self.xyz = xyz
+        self.rpy = rpy or [0, 0, 0]
         self.parent = parent
         self.child = child
         self.joint_xml = None
@@ -29,7 +30,8 @@ class Joint:
         joint.attrib = {'name': self.name, 'type': self.type}
 
         origin = SubElement(joint, 'origin')
-        origin.attrib = {'xyz': ' '.join([str(_) for _ in self.xyz]), 'rpy': '0 0 0'}
+        rpy_str = ' '.join([str(_) for _ in self.rpy])
+        origin.attrib = {'xyz': ' '.join([str(_) for _ in self.xyz]), 'rpy': rpy_str}
         parent = SubElement(joint, 'parent')
         parent.attrib = {'link': self.parent}
         child = SubElement(joint, 'child')
@@ -105,9 +107,18 @@ def make_joints_dict(root, msg, base_link_name=None):
             max_enabled = joint.jointMotion.rotationLimits.isMaximumValueEnabled
             min_enabled = joint.jointMotion.rotationLimits.isMinimumValueEnabled
 
+            # URDF q=0 is the assembled pose (the joint origin is built from the
+            # current occurrence transforms), but Fusion limits are measured from
+            # the joint's internal zero. Shift them by the current angle so the
+            # assembled pose lands correctly inside the limit range.
+            try:
+                cur = joint.jointMotion.rotationValue
+            except:
+                cur = 0.0
+
             if max_enabled and min_enabled:
-                joint_dict['upper_limit'] = round(joint.jointMotion.rotationLimits.maximumValue, 6)
-                joint_dict['lower_limit'] = round(joint.jointMotion.rotationLimits.minimumValue, 6)
+                joint_dict['upper_limit'] = round(joint.jointMotion.rotationLimits.maximumValue - cur, 6)
+                joint_dict['lower_limit'] = round(joint.jointMotion.rotationLimits.minimumValue - cur, 6)
             elif max_enabled and not min_enabled:
                 msg = joint.name + ' is not set its lower limit.'
                 break
@@ -122,9 +133,16 @@ def make_joints_dict(root, msg, base_link_name=None):
             max_enabled = joint.jointMotion.slideLimits.isMaximumValueEnabled
             min_enabled = joint.jointMotion.slideLimits.isMinimumValueEnabled
 
+            # Same offset as revolute: shift the slide limits by the current
+            # (assembled) slide value so URDF q=0 matches the assembled pose.
+            try:
+                cur = joint.jointMotion.slideValue
+            except:
+                cur = 0.0
+
             if max_enabled and min_enabled:
-                joint_dict['upper_limit'] = round(joint.jointMotion.slideLimits.maximumValue / 100, 6)
-                joint_dict['lower_limit'] = round(joint.jointMotion.slideLimits.minimumValue / 100, 6)
+                joint_dict['upper_limit'] = round((joint.jointMotion.slideLimits.maximumValue - cur) / 100, 6)
+                joint_dict['lower_limit'] = round((joint.jointMotion.slideLimits.minimumValue - cur) / 100, 6)
             elif max_enabled and not min_enabled:
                 msg = joint.name + ' is not set its lower limit.'
                 break
@@ -150,45 +168,28 @@ def make_joints_dict(root, msg, base_link_name=None):
         else:
             joint_dict['child'] = utils.normalize_name(joint.occurrenceOne.name)
 
-        def trans(M, a):
-            ex = [M[0], M[4], M[8]]
-            ey = [M[1], M[5], M[9]]
-            ez = [M[2], M[6], M[10]]
-            oo = [M[3], M[7], M[11]]
-            b = [0, 0, 0]
-            for i in range(3):
-                b[i] = a[0] * ex[i] + a[1] * ey[i] + a[2] * ez[i] + oo[i]
-            return b
-
-        def allclose(v1, v2, tol=1e-6):
-            return max([abs(a - b) for a, b in zip(v1, v2)]) < tol
-
+        # The exported STL meshes are in each component's LOCAL coordinates, so
+        # every link frame coincides with its component origin and the visual
+        # origin is 0. The joint origin must therefore be the full relative pose
+        # of the child component frame expressed in the parent frame:
+        #     T_rel = M_parent^-1 * M_child
+        # This yields both translation (in the parent frame) and rotation (rpy),
+        # so it works for rotated components -- unlike the old world-axis
+        # subtraction, which scrambled limbs whenever a part was rotated.
         try:
-            xyz_from_one_to_joint = joint.geometryOrOriginOne.origin.asArray()
-            xyz_from_two_to_joint = joint.geometryOrOriginTwo.origin.asArray()
-            xyz_of_one = joint.occurrenceOne.transform.translation.asArray()
-            xyz_of_two = joint.occurrenceTwo.transform.translation.asArray()
-            M_two = joint.occurrenceTwo.transform.asArray()
+            parent_tf = joint.occurrenceTwo.transform
+            child_tf = joint.occurrenceOne.transform
+            xyz, rpy = utils.get_relative_transform(parent_tf, child_tf)
+            joint_dict['xyz'] = xyz
+            joint_dict['rpy'] = rpy
 
-            case1 = allclose(xyz_from_two_to_joint, xyz_from_one_to_joint)
-            case2 = allclose(xyz_from_two_to_joint, xyz_of_one)
-            if case1 or case2:
-                xyz_of_joint = xyz_from_two_to_joint
-            else:
-                xyz_of_joint = trans(M_two, xyz_from_two_to_joint)
-
-            joint_dict['xyz'] = [round(i / 100.0, 6) for i in xyz_of_joint]
-
-        except:
-            try:
-                if type(joint.geometryOrOriginTwo) == adsk.fusion.JointOrigin:
-                    data = joint.geometryOrOriginTwo.geometry.origin.asArray()
-                else:
-                    data = joint.geometryOrOriginTwo.origin.asArray()
-                joint_dict['xyz'] = [round(i / 100.0, 6) for i in data]
-            except:
-                msg = joint.name + " doesn't have joint origin."
-                break
+            # Fusion reports the rotation/slide axis in world coordinates;
+            # URDF expects it in the child (joint) frame.
+            if joint_type in ('revolute', 'prismatic') or joint_dict['type'] == 'continuous':
+                joint_dict['axis'] = utils.world_axis_to_child(child_tf, joint_dict['axis'])
+        except Exception as e:
+            msg = joint.name + " transform error: " + str(e)
+            break
 
         joints_dict[utils.normalize_name(joint.name)] = joint_dict
 

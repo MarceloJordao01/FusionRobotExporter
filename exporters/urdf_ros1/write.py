@@ -36,14 +36,9 @@ def write_link_urdf(joints_dict, repo, links_xyz_dict, links_rpy_dict, file_name
         # Other links
         for joint in joints_dict:
             name = joints_dict[joint]['child']
-            center_of_mass = [
-                i - j for i, j in zip(
-                    inertial_dict[name]['center_of_mass'],
-                    joints_dict[joint]['xyz']
-                )
-            ]
-            # Get rpy from inertial_dict (extracted from occurrence transform)
-            rpy = inertial_dict[name].get('rpy', [0, 0, 0])
+            # center_of_mass is already expressed in the link's local frame.
+            center_of_mass = inertial_dict[name]['center_of_mass']
+            rpy = [0, 0, 0]
             link = Link.Link(
                 name=name,
                 xyz=joints_dict[joint]['xyz'],
@@ -70,20 +65,10 @@ def write_joint_urdf(joints_dict, repo, links_xyz_dict, file_name):
             upper_limit = joints_dict[j]['upper_limit']
             lower_limit = joints_dict[j]['lower_limit']
 
-            try:
-                xyz = [
-                    round(p - c, 6)
-                    for p, c in zip(links_xyz_dict[parent], links_xyz_dict[child])
-                ]
-            except KeyError:
-                app = adsk.core.Application.get()
-                ui = app.userInterface
-                ui.messageBox(
-                    f"Error with connection between {parent} and {child}.\n"
-                    f"Check if parent=component2={parent} and child=component1={child} are correct.",
-                    "Error!"
-                )
-                return
+            # The joint origin is the full relative pose (translation in the
+            # parent frame + rotation) computed in make_joints_dict.
+            xyz = joints_dict[j]['xyz']
+            rpy = joints_dict[j].get('rpy', [0, 0, 0])
 
             joint = Joint.Joint(
                 name=j,
@@ -93,7 +78,8 @@ def write_joint_urdf(joints_dict, repo, links_xyz_dict, file_name):
                 parent=parent,
                 child=child,
                 upper_limit=upper_limit,
-                lower_limit=lower_limit
+                lower_limit=lower_limit,
+                rpy=rpy
             )
             joint.make_joint_xml()
             f.write(joint.joint_xml)
@@ -168,13 +154,8 @@ def write_transmissions_xacro(joints_dict, links_xyz_dict, package_name, robot_n
             upper_limit = joints_dict[j]['upper_limit']
             lower_limit = joints_dict[j]['lower_limit']
 
-            try:
-                xyz = [
-                    round(p - c, 6)
-                    for p, c in zip(links_xyz_dict[parent], links_xyz_dict[child])
-                ]
-            except KeyError:
-                continue
+            xyz = joints_dict[j]['xyz']
+            rpy = joints_dict[j].get('rpy', [0, 0, 0])
 
             joint = Joint.Joint(
                 name=j,
@@ -184,7 +165,8 @@ def write_transmissions_xacro(joints_dict, links_xyz_dict, package_name, robot_n
                 parent=parent,
                 child=child,
                 upper_limit=upper_limit,
-                lower_limit=lower_limit
+                lower_limit=lower_limit,
+                rpy=rpy
             )
 
             if joint_type != 'fixed':

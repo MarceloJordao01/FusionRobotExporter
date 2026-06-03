@@ -224,3 +224,94 @@ def get_occurrence_transform(occurrence):
     rpy = matrix3d_to_rpy(transform)
 
     return xyz, rpy
+
+
+def _rotation_matrix(transform):
+    """Extract the 3x3 rotation matrix (row-major) from a Fusion Matrix3D."""
+    R = [[0, 0, 0], [0, 0, 0], [0, 0, 0]]
+    for row in range(3):
+        for col in range(3):
+            R[row][col] = transform.getCell(row, col)
+    return R
+
+
+def _rpy_from_matrix(R):
+    """Extract URDF roll/pitch/yaw (radians) from a 3x3 rotation matrix R."""
+    sy = math.sqrt(R[0][0] ** 2 + R[1][0] ** 2)
+    singular = sy < 1e-6
+    if not singular:
+        roll = math.atan2(R[2][1], R[2][2])
+        pitch = math.atan2(-R[2][0], sy)
+        yaw = math.atan2(R[1][0], R[0][0])
+    else:
+        roll = math.atan2(-R[1][2], R[1][1])
+        pitch = math.atan2(-R[2][0], sy)
+        yaw = 0
+    return [round(roll, 6), round(pitch, 6), round(yaw, 6)]
+
+
+def get_relative_rpy(parent_transform, child_transform):
+    """
+    Calculate the relative rotation (rpy) from parent frame to child frame.
+    Returns [roll, pitch, yaw] in radians.
+    """
+    R_parent = _rotation_matrix(parent_transform)
+    R_child = _rotation_matrix(child_transform)
+
+    # R_relative = R_parent^T * R_child
+    R_rel = [[0, 0, 0], [0, 0, 0], [0, 0, 0]]
+    for i in range(3):
+        for j in range(3):
+            R_rel[i][j] = sum(R_parent[k][i] * R_child[k][j] for k in range(3))
+
+    return _rpy_from_matrix(R_rel)
+
+
+def get_relative_transform(parent_transform, child_transform):
+    """
+    Full relative pose of the child occurrence frame expressed in the PARENT
+    occurrence frame: T_rel = M_parent^-1 * M_child.
+
+    This is exactly what a URDF <joint><origin> needs: the child link frame
+    located relative to the parent link frame.
+
+    Returns (xyz, rpy):
+      xyz : [x, y, z] translation in METERS, expressed in the parent frame
+      rpy : [roll, pitch, yaw] in radians
+    """
+    R_parent = _rotation_matrix(parent_transform)
+    t_parent = parent_transform.translation.asArray()  # cm
+    t_child = child_transform.translation.asArray()     # cm
+
+    # t_rel = R_parent^T * (t_child - t_parent)   (still in cm)
+    dt = [t_child[i] - t_parent[i] for i in range(3)]
+    t_rel = [sum(R_parent[k][i] * dt[k] for k in range(3)) for i in range(3)]
+    xyz = [round(t_rel[i] / 100.0, 6) for i in range(3)]
+
+    rpy = get_relative_rpy(parent_transform, child_transform)
+    return xyz, rpy
+
+
+def world_axis_to_child(child_transform, axis_world):
+    """
+    Express a world-frame axis vector in the child occurrence frame.
+    In URDF the joint <axis> is given in the child (joint) frame, while Fusion
+    reports rotation/slide axes in world coordinates.
+      axis_child = R_child^T * axis_world
+    """
+    R_child = _rotation_matrix(child_transform)
+    ac = [sum(R_child[k][i] * axis_world[k] for k in range(3)) for i in range(3)]
+    return [round(v, 6) for v in ac]
+
+
+def world_point_to_link(occ_transform, world_point_cm):
+    """
+    Express a world-frame point (in cm) in the occurrence/link local frame.
+    Returns [x, y, z] in METERS.
+      p_link = R^T * (p_world - t)
+    """
+    R = _rotation_matrix(occ_transform)
+    t = occ_transform.translation.asArray()  # cm
+    d = [world_point_cm[i] - t[i] for i in range(3)]
+    p_link = [sum(R[k][i] * d[k] for k in range(3)) for i in range(3)]
+    return [round(v / 100.0, 6) for v in p_link]
