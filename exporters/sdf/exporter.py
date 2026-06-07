@@ -11,7 +11,8 @@ from pathlib import Path
 
 from .log import set_log_console, log
 from .sdf import SDF
-from ...core import sensors as core_sensors
+from ...core.progress import ProgressReporter, count_component_bodies
+from ...core.rigid_groups import count_rigid_groups_bodies
 
 
 def export(design, save_dir, options=None):
@@ -29,10 +30,12 @@ def export(design, save_dir, options=None):
     tuple: (success: bool, message: str)
     """
     options = options or {}
+    progress = None
 
     try:
         app = adsk.core.Application.get()
         ui = app.userInterface
+        progress = ProgressReporter(ui)
 
         # Setup logging to Fusion console
         console = ui.palettes.itemById('TextCommands')
@@ -61,16 +64,21 @@ def export(design, save_dir, options=None):
         else:
             meshes_cache_path = None
 
-        # Load sensors from JSON if available
-        sensors_file = options.get('sensors_file')
-        if not sensors_file:
-            sensors_file = core_sensors.find_sensors_file(str(sdf_dir_path))
-        sensors = core_sensors.load_sensors(sensors_file) if sensors_file else []
-        if sensors:
-            log(f'Loaded {len(sensors)} sensors from "{sensors_file}"\n')
-
         # Generate SDF
-        sdf = SDF(design, meshes_cache_path, sensors)
+        link_mode = options.get('link_mode', 'components')
+
+        root = design.rootComponent
+        if link_mode == 'rigid_groups':
+            total = count_rigid_groups_bodies(root)
+        else:
+            total = count_component_bodies(root)
+        progress.start(total, 'Exporting SDF', 'Exporting bodies...', unit='bodies')
+
+        sdf = SDF(design, meshes_cache_path, link_mode, options.get('base_link'), progress=progress)
+
+        if progress.is_cancelled():
+            return False, 'Export cancelled by user.'
+
         sdf.print()
         sdf.save(sdf_dir_path)
 
@@ -79,3 +87,6 @@ def export(design, save_dir, options=None):
     except Exception as e:
         import traceback
         return False, f'Export failed: {str(e)}\n{traceback.format_exc()}'
+    finally:
+        if progress is not None:
+            progress.finish()

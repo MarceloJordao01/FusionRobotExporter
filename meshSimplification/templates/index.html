@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>FusionRobotExporter — URDF/SDF Viewer</title>
+  <style>
+    html, body { margin: 0; height: 100%; font-family: system-ui, sans-serif; background: #1e1e22; color: #ddd; }
+    #app { display: flex; height: 100%; }
+    #sidebar { width: 280px; padding: 14px; box-sizing: border-box; background: #26262c; overflow-y: auto; }
+    #sidebar h1 { font-size: 15px; margin: 0 0 12px; }
+    button { padding: 8px 10px; box-sizing: border-box; background: #34343c; color: #eee;
+             border: 1px solid #44444c; border-radius: 4px; cursor: pointer; font-size: 13px; }
+    button:hover { background: #3d3d47; }
+    #openBtn { width: 100%; margin-bottom: 12px; }
+    #current { font-size: 12px; color: #8ab4f8; word-break: break-all; margin-bottom: 14px; }
+    .chk { display: flex; align-items: center; gap: 7px; font-size: 13px; margin-bottom: 10px; cursor: pointer; }
+    .settings { border-top: 1px solid #34343c; padding-top: 12px; margin-bottom: 14px; }
+    .settings .field { margin-bottom: 12px; }
+    .settings label { font-size: 12px; color: #aaa; display: flex; justify-content: space-between; }
+    .settings input[type=range] { width: 100%; margin-top: 4px; }
+    .settings .val { color: #8ab4f8; }
+    #status { font-size: 12px; white-space: pre-wrap; line-height: 1.4; }
+    #status .err { color: #ff8080; }
+    #status .ok { color: #88cc88; }
+    #viewport { flex: 1; position: relative; }
+    canvas { display: block; }
+
+    /* Modal file browser */
+    #modal { position: fixed; inset: 0; background: rgba(0,0,0,0.55);
+             display: flex; align-items: center; justify-content: center; z-index: 10; }
+    #modal.hidden { display: none; }
+    .dialog { width: 560px; max-width: 92vw; height: 70vh; display: flex; flex-direction: column;
+              background: #26262c; border: 1px solid #44444c; border-radius: 8px; overflow: hidden;
+              box-shadow: 0 12px 40px rgba(0,0,0,0.5); }
+    .dlg-head { display: flex; align-items: center; gap: 8px; padding: 10px 12px;
+                background: #2e2e36; border-bottom: 1px solid #3a3a44; }
+    .dlg-head .title { font-size: 13px; font-weight: 600; }
+    #dlgPath { flex: 1; font-size: 12px; color: #8ab4f8; word-break: break-all; }
+    #dlgClose { padding: 4px 9px; }
+    .dlg-list { flex: 1; overflow-y: auto; }
+    .row { padding: 8px 14px; font-size: 13px; cursor: pointer; border-bottom: 1px solid #2c2c33; }
+    .row:hover { background: #34343c; }
+    .row.dir { color: #e0c987; }
+    .row.file { color: #9fd09f; }
+    .empty { padding: 12px 14px; font-size: 12px; color: #777; }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <div id="sidebar">
+      <h1>URDF / SDF Viewer</h1>
+      <button id="openBtn">📂 Open URDF / SDF…</button>
+      <div id="current">No file loaded</div>
+      <label class="chk"><input type="checkbox" id="showJoints" checked> Show joints</label>
+      <label class="chk"><input type="checkbox" id="showNames" checked> Show joint names</label>
+
+      <div class="settings">
+        <div class="field">
+          <label>Joint name size <span class="val" id="fontVal">1.0×</span></label>
+          <input type="range" id="fontSize" min="0.3" max="4" step="0.1" value="1">
+        </div>
+        <div class="field">
+          <label>Frame size <span class="val" id="axisVal">1.0×</span></label>
+          <input type="range" id="axisSize" min="0.3" max="4" step="0.1" value="1">
+        </div>
+      </div>
+
+      <div id="status">Click “Open” to pick a file.</div>
+    </div>
+    <div id="viewport"></div>
+  </div>
+
+  <div id="modal" class="hidden">
+    <div class="dialog">
+      <div class="dlg-head">
+        <span class="title">Open</span>
+        <span id="dlgPath">/</span>
+        <button id="dlgClose">✕</button>
+      </div>
+      <div id="dlgList" class="dlg-list"></div>
+    </div>
+  </div>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+  <script type="module" src="/static/viewer.js"></script>
+</body>
+</html>

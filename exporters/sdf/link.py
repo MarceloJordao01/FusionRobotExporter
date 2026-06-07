@@ -104,6 +104,8 @@ class Link:
         self.visuals: Dict[str, LinkElement] = {}
         self.collisions: Dict[str, LinkElement] = {}
         self.inertial: LinkInertial = None
+        # Sensor <sensor> elements (ElementTree) attached to this link.
+        self.sensors: List = []
 
     def __str__(self):
         visuals = ', '.join([str(visual) for visual in self.visuals.values()])
@@ -124,5 +126,8 @@ class Link:
 
         for collision in self.collisions.values():
             collision.to_sdf_element(link_node)
+
+        for sensor in self.sensors:
+            link_node.append(sensor)
 
         return link_node

@@ -75,11 +75,21 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
             ros_dropdown.listItems.add('ROS1', False)
             ros_dropdown.listItems.add('ROS2', True)
 
-            # --- Base Link Selection ---
+            # --- Link Configuration ---
+            # Kept in its own (always visible) group because the base link
+            # selection is also needed for SDF when using rigid-group mode.
             app = adsk.core.Application.get()
             design = adsk.fusion.Design.cast(app.activeProduct)
 
-            base_link_dropdown = ros_group_children.addDropDownCommandInput(
+            link_group = inputs.addGroupCommandInput('link_group', 'Link Configuration')
+            link_group_children = link_group.children
+
+            # When checked, each Rigid Group becomes a single merged link and the
+            # Base Link dropdown lists the rigid groups instead of occurrences.
+            link_group_children.addBoolValueInput(
+                'link_mode_rigid', 'Define links by Rigid Group', True, '', False)
+
+            base_link_dropdown = link_group_children.addDropDownCommandInput(
                 'base_link',
                 'Base Link',
                 adsk.core.DropDownStyles.TextListDropDownStyle
@@ -88,7 +98,7 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
             if design:
                 root = design.rootComponent
 
-                # Populate dropdown - first occurrence is selected by default
+                # Default (component mode): populate with occurrences.
                 first = True
                 for occ in root.allOccurrences:
                     base_link_dropdown.listItems.add(occ.name, first)
@@ -123,14 +133,6 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
             collision_type.listItems.add('Mesh', True)
             collision_type.listItems.add('Bounding Box', False)
             collision_type.listItems.add('Simplified', False)
-
-            # --- Sensors Configuration ---
-            sensors_group = inputs.addGroupCommandInput('sensors_group', 'Sensors Configuration')
-            sensors_group_children = sensors_group.children
-
-            sensors_group_children.addBoolValueInput('include_sensors', 'Include Sensors', True, '', False)
-            sensors_group_children.addStringValueInput('sensors_file', 'Sensors File', '')
-            sensors_group_children.addBoolValueInput('sensors_browse', 'Browse...', False)
 
             # --- Event handlers ---
             on_execute = CommandExecuteHandler()
@@ -178,25 +180,28 @@ class CommandInputChangedHandler(adsk.core.InputChangedEventHandler):
                 else:
                     mesh_format.listItems.item(0).isSelected = True  # STL for URDF
 
-            # Handle sensors browse button
-            if changed_input.id == 'sensors_browse' and changed_input.value:
+            # Repopulate the Base Link dropdown when the link mode toggles
+            if changed_input.id == 'link_mode_rigid':
                 app = adsk.core.Application.get()
-                ui = app.userInterface
+                design = adsk.fusion.Design.cast(app.activeProduct)
+                base_link_dropdown = inputs.itemById('base_link')
+                base_link_dropdown.listItems.clear()
 
-                file_dialog = ui.createFileDialog()
-                file_dialog.title = 'Select Sensors JSON File'
-                file_dialog.filter = 'JSON Files (*.json);;All Files (*.*)'
-                file_dialog.filterIndex = 0
-
-                result = file_dialog.showOpen()
-                if result == adsk.core.DialogResults.DialogOK:
-                    sensors_file_input = inputs.itemById('sensors_file')
-                    sensors_file_input.value = file_dialog.filename
-                    include_sensors = inputs.itemById('include_sensors')
-                    include_sensors.value = True
-
-                # Reset button state
-                changed_input.value = False
+                if design:
+                    root = design.rootComponent
+                    if changed_input.value:
+                        # Rigid-group mode: list the rigid groups.
+                        from .core import rigid_groups as core_rigid
+                        first = True
+                        for name in core_rigid.list_rigid_group_names(root):
+                            base_link_dropdown.listItems.add(name, first)
+                            first = False
+                    else:
+                        # Component mode: list the occurrences.
+                        first = True
+                        for occ in root.allOccurrences:
+                            base_link_dropdown.listItems.add(occ.name, first)
+                            first = False
 
         except:
             pass
@@ -229,8 +234,7 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
             export_launch = inputs.itemById('export_launch').value
             mesh_format = inputs.itemById('mesh_format').selectedItem.name
             collision_type = inputs.itemById('collision_type').selectedItem.name
-            include_sensors = inputs.itemById('include_sensors').value
-            sensors_file = inputs.itemById('sensors_file').value
+            link_mode = 'rigid_groups' if inputs.itemById('link_mode_rigid').value else 'components'
 
             # Ask for save location
             folder_dialog = ui.createFolderDialog()
@@ -251,8 +255,7 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                 'export_launch': export_launch,
                 'mesh_format': mesh_format,
                 'collision_type': collision_type,
-                'include_sensors': include_sensors,
-                'sensors_file': sensors_file,
+                'link_mode': link_mode,
             }
 
             # Call appropriate exporter

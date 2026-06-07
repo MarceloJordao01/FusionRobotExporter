@@ -69,7 +69,7 @@ def get_bodies_from_occurrence(occ: adsk.fusion.Occurrence):
     return None, 'none'
 
 
-def export_stl(design: adsk.fusion.Design, save_dir: str, occurrences=None, prefix_names=False, base_link_name=None):
+def export_stl(design: adsk.fusion.Design, save_dir: str, occurrences=None, prefix_names=False, base_link_name=None, progress=None):
     """
     Export STL files for all occurrences directly (no temporary components).
 
@@ -80,6 +80,7 @@ def export_stl(design: adsk.fusion.Design, save_dir: str, occurrences=None, pref
     occurrences: list - optional list of (occurrence, prefix) tuples. If None, exports all.
     prefix_names: bool - if True, prepend prefix to filename for subassembly components
     base_link_name: str - occurrence name to rename to 'base_link' (optional)
+    progress: ProgressReporter - optional progress window (one step per exported mesh)
 
     Returns
     -------
@@ -97,8 +98,18 @@ def export_stl(design: adsk.fusion.Design, save_dir: str, occurrences=None, pref
     errors = []
 
     for occ, prefix in occurrences:
+        if progress is not None and progress.is_cancelled():
+            break
+
         occ_name = normalize_name(occ.name)
         comp_name = normalize_name(occ.component.name)
+
+        # Sensor mounts (sensor__*) are not robot links: no mesh.
+        try:
+            if occ.component.name.startswith('sensor__'):
+                continue
+        except Exception:
+            pass
 
         if occ_name in exported:
             continue
@@ -119,6 +130,9 @@ def export_stl(design: adsk.fusion.Design, save_dir: str, occurrences=None, pref
             file_name = occ_name
 
         file_path = os.path.join(meshes_dir, file_name + '.stl')
+
+        if progress is not None:
+            progress.step(file_name)
 
         try:
             export_target = occ if source == 'direct' else occ.nativeObject

@@ -1,618 +1,370 @@
 # -*- coding: utf-8 -*-
 """
-Sensor definitions loader and XML generator for URDF/SDF
-Reads sensor configuration from JSON file and generates appropriate XML
+Sensor support via naming convention (shared by all exporters).
+
+A component named
+
+    sensor__<type>__<link>[__<name>]
+
+(double underscore '__' as the field separator, parsed from the RAW component
+name so it survives the single-underscore collapse of normalize_name) is treated
+as a simulation sensor mounted on <link>. Its pose is taken from the component's
+transform expressed in the <link> frame. Such components are excluded from the
+links / joints / meshes of the robot.
+
+  <type> in: camera, depth, lidar, imu, gps, contact
+  <link>   : the target link name (normalized); 'base_link' for the base
+  <name>   : optional sensor name (defaults to <type>)
+
+Examples:
+  sensor__camera__base_link__frontal
+  sensor__lidar__base_link__topo
+  sensor__imu__base_link
 """
 
-import json
-import os
-from pathlib import Path
+import math
+from xml.etree.ElementTree import Element, SubElement, tostring
+from xml.dom import minidom
 
+import adsk.core
 
-# Default parameters for each sensor type
+from .mesh import normalize_name
+
+SENSOR_PREFIX = 'sensor__'
+SENSOR_TYPES = ('camera', 'depth', 'lidar', 'imu', 'gps', 'contact')
+
+# Reasonable defaults per sensor type. Tweak in the generated files as needed.
 SENSOR_DEFAULTS = {
-    'camera': {
-        'update_rate': 30.0,
-        'width': 640,
-        'height': 480,
-        'fov': 1.047,  # ~60 degrees in radians
-        'clip': {'near': 0.1, 'far': 100.0},
-        'noise': {'type': 'gaussian', 'mean': 0.0, 'stddev': 0.007}
-    },
-    'depth_camera': {
-        'update_rate': 30.0,
-        'width': 640,
-        'height': 480,
-        'fov': 1.047,
-        'clip': {'near': 0.1, 'far': 10.0},
-        'noise': {'type': 'gaussian', 'mean': 0.0, 'stddev': 0.007}
-    },
-    'lidar': {
-        'update_rate': 10.0,
-        'samples': 360,
-        'resolution': 1.0,
-        'range': {'min': 0.1, 'max': 10.0},
-        'angle': {'min': -3.14159, 'max': 3.14159},  # full 360 degrees
-        'noise': {'type': 'gaussian', 'mean': 0.0, 'stddev': 0.01}
-    },
-    'imu': {
-        'update_rate': 100.0,
-        'accel_noise': {'mean': 0.0, 'stddev': 0.01},
-        'gyro_noise': {'mean': 0.0, 'stddev': 0.01}
-    },
-    'gps': {
-        'update_rate': 10.0,
-        'position_noise': {'horizontal': 0.5, 'vertical': 1.0},
-        'velocity_noise': {'horizontal': 0.1, 'vertical': 0.1}
-    },
-    'contact': {
-        'update_rate': 100.0,
-        'topic': 'contact_sensor'
-    }
+    'camera':  {'update_rate': 30, 'horizontal_fov': 1.396263, 'width': 640, 'height': 480,
+                'near': 0.1, 'far': 100.0},
+    'depth':   {'update_rate': 30, 'horizontal_fov': 1.047198, 'width': 640, 'height': 480,
+                'near': 0.05, 'far': 8.0},
+    'lidar':   {'update_rate': 10, 'samples': 360, 'min_angle': -math.pi, 'max_angle': math.pi,
+                'range_min': 0.1, 'range_max': 30.0},
+    'imu':     {'update_rate': 100},
+    'gps':     {'update_rate': 1},
+    'contact': {'update_rate': 50},
 }
 
 
-def load_sensors(json_path):
+# ---------------------------------------------------------------------------
+# Detection / parsing
+# ---------------------------------------------------------------------------
+
+def is_sensor_name(raw_name):
+    return bool(raw_name) and raw_name.startswith(SENSOR_PREFIX)
+
+
+def is_sensor_occurrence(occ):
+    """True if this occurrence is a sensor mount (by its component name)."""
+    try:
+        return is_sensor_name(occ.component.name)
+    except Exception:
+        return False
+
+
+def parse_sensor_name(raw_name):
     """
-    Load sensors from JSON file
-
-    Parameters
-    ----------
-    json_path : str or Path
-        Path to sensors.json file
-
-    Returns
-    -------
-    list : List of sensor dictionaries with defaults applied
+    Parse 'sensor__<type>__<link>[__<name>]'. Returns a dict
+    {'type', 'link', 'name'} or None if the name is not a valid sensor tag.
     """
-    json_path = Path(json_path)
-    if not json_path.exists():
-        return []
+    if not is_sensor_name(raw_name):
+        return None
+    parts = raw_name.split('__')
+    # parts[0] == 'sensor'
+    if len(parts) < 3:
+        return None
+    sensor_type = parts[1].strip().lower()
+    link_token = parts[2].strip()
+    name_token = parts[3].strip() if len(parts) >= 4 and parts[3].strip() else sensor_type
+    if sensor_type not in SENSOR_TYPES or not link_token:
+        return None
+    return {
+        'type': sensor_type,
+        'link': normalize_name(link_token),
+        'name': normalize_name(name_token),
+    }
 
-    with open(json_path, 'r', encoding='utf-8') as f:
-        data = json.load(f)
 
-    sensors = data.get('sensors', [])
+# ---------------------------------------------------------------------------
+# Pose helpers (kept independent of any exporter's utils)
+# ---------------------------------------------------------------------------
 
-    # Apply defaults for each sensor
-    for sensor in sensors:
-        sensor_type = sensor.get('type', 'camera')
-        defaults = SENSOR_DEFAULTS.get(sensor_type, {})
+def _mat_mul(a, b):
+    """Multiply two 4x4 matrices given as flat 16-element row-major lists."""
+    out = [0.0] * 16
+    for r in range(4):
+        for c in range(4):
+            out[r * 4 + c] = (
+                a[r * 4 + 0] * b[0 * 4 + c] +
+                a[r * 4 + 1] * b[1 * 4 + c] +
+                a[r * 4 + 2] * b[2 * 4 + c] +
+                a[r * 4 + 3] * b[3 * 4 + c]
+            )
+    return out
 
-        # Merge defaults with provided params
-        if 'params' not in sensor:
-            sensor['params'] = {}
 
-        for key, value in defaults.items():
-            if key not in sensor['params']:
-                sensor['params'][key] = value
+def _rigid_inverse(m):
+    """Inverse of a rigid transform (rotation + translation), flat 16 list."""
+    # R^T
+    r = [
+        m[0], m[4], m[8],
+        m[1], m[5], m[9],
+        m[2], m[6], m[10],
+    ]
+    t = [m[3], m[7], m[11]]
+    # -R^T t
+    tx = -(r[0] * t[0] + r[1] * t[1] + r[2] * t[2])
+    ty = -(r[3] * t[0] + r[4] * t[1] + r[5] * t[2])
+    tz = -(r[6] * t[0] + r[7] * t[1] + r[8] * t[2])
+    return [
+        r[0], r[1], r[2], tx,
+        r[3], r[4], r[5], ty,
+        r[6], r[7], r[8], tz,
+        0.0, 0.0, 0.0, 1.0,
+    ]
 
+
+def _matrix_to_xyz_rpy(m):
+    """
+    Extract (xyz in METERS, rpy radians) from a flat 16 row-major transform whose
+    translation is in Fusion internal cm. rpy is fixed-axis XYZ (URDF/SDF).
+    """
+    xyz = [round(m[3] / 100.0, 6), round(m[7] / 100.0, 6), round(m[11] / 100.0, 6)]
+
+    r00, r01, r02 = m[0], m[1], m[2]
+    r10, r11, r12 = m[4], m[5], m[6]
+    r20, r21, r22 = m[8], m[9], m[10]
+
+    sy = math.sqrt(r00 * r00 + r10 * r10)
+    if sy > 1e-6:
+        roll = math.atan2(r21, r22)
+        pitch = math.atan2(-r20, sy)
+        yaw = math.atan2(r10, r00)
+    else:
+        roll = math.atan2(-r12, r11)
+        pitch = math.atan2(-r20, sy)
+        yaw = 0.0
+    rpy = [round(roll, 6), round(pitch, 6), round(yaw, 6)]
+    return xyz, rpy
+
+
+def _relative_xyz_rpy(link_tf, sensor_tf):
+    """Pose of sensor_tf expressed in link_tf's frame -> (xyz m, rpy rad)."""
+    link = list(link_tf.asArray())
+    sensor = list(sensor_tf.asArray())
+    rel = _mat_mul(_rigid_inverse(link), sensor)
+    return _matrix_to_xyz_rpy(rel)
+
+
+# ---------------------------------------------------------------------------
+# Link transform maps (per link mode) + sensor collection
+# ---------------------------------------------------------------------------
+
+def build_component_link_transforms(root, base_link_name=None):
+    """
+    Map link_name -> world Matrix3D for the component link mode. Sensor mounts
+    are skipped. The base link is keyed as 'base_link'.
+    """
+    transforms = {}
+
+    def rec(occurrences):
+        for occ in occurrences:
+            if is_sensor_occurrence(occ):
+                continue
+            is_base = (base_link_name and occ.name == base_link_name) or \
+                      (not base_link_name and occ.component.name == 'base_link')
+            key = 'base_link' if is_base else normalize_name(occ.name)
+            transforms[key] = occ.transform
+            if occ.childOccurrences.count > 0:
+                rec(occ.childOccurrences)
+
+    rec(root.occurrences)
+    return transforms
+
+
+def build_rigid_link_transforms(link_frames):
+    """
+    Map link_name -> world Matrix3D for the rigid-group link mode. Each group
+    link frame is world-aligned and translated to its joint point P (meters),
+    matching make_rigid_group_joints_dict. 'base_link' is the world origin.
+    """
+    transforms = {}
+    for link_name, P in link_frames.items():
+        m = adsk.core.Matrix3D.create()
+        m.translation = adsk.core.Vector3D.create(P[0] * 100.0, P[1] * 100.0, P[2] * 100.0)
+        transforms[link_name] = m
+    return transforms
+
+
+def collect_sensors(root, link_transforms):
+    """
+    Walk the assembly and return a list of sensor dicts:
+      {'type', 'name', 'link', 'xyz', 'rpy', 'params'}  (or {'error': ...})
+
+    link_transforms: {link_name: Matrix3D} built by build_component_link_transforms
+    (component mode) or by the caller for the rigid-group mode.
+    """
+    sensors = []
+
+    def rec(occurrences):
+        for occ in occurrences:
+            if is_sensor_occurrence(occ):
+                spec = parse_sensor_name(occ.component.name)
+                if spec is None:
+                    sensors.append({'error': f"invalid sensor name '{occ.component.name}'"})
+                else:
+                    link_tf = link_transforms.get(spec['link'])
+                    if link_tf is None:
+                        sensors.append({**spec,
+                                        'error': f"sensor '{spec['name']}': link '{spec['link']}' not found"})
+                    else:
+                        xyz, rpy = _relative_xyz_rpy(link_tf, occ.transform)
+                        sensors.append({
+                            'type': spec['type'],
+                            'name': spec['name'],
+                            'link': spec['link'],
+                            'xyz': xyz,
+                            'rpy': rpy,
+                            'params': dict(SENSOR_DEFAULTS.get(spec['type'], {})),
+                        })
+            if occ.childOccurrences.count > 0:
+                rec(occ.childOccurrences)
+
+    rec(root.occurrences)
     return sensors
 
 
-def find_sensors_file(save_dir, design_name=None):
-    """
-    Find sensors.json file in common locations
+# ---------------------------------------------------------------------------
+# XML generation
+# ---------------------------------------------------------------------------
 
-    Searches in order:
-    1. save_dir/sensors.json
-    2. Fusion document directory (if available)
-
-    Parameters
-    ----------
-    save_dir : str
-        Export save directory
-    design_name : str, optional
-        Name of the design for filename matching
-
-    Returns
-    -------
-    str or None : Path to sensors.json if found
-    """
-    search_paths = [
-        Path(save_dir) / 'sensors.json',
-        Path(save_dir).parent / 'sensors.json',
-    ]
-
-    for path in search_paths:
-        if path.exists():
-            return str(path)
-
-    return None
+# Sensor <type> string per target. ros1 = Gazebo classic, ros2/sdf = new Gz.
+_TYPE_STR = {
+    'camera':  {'classic': 'camera',      'gz': 'camera'},
+    'depth':   {'classic': 'depth',       'gz': 'depth_camera'},
+    'lidar':   {'classic': 'ray',         'gz': 'gpu_lidar'},
+    'imu':     {'classic': 'imu',         'gz': 'imu'},
+    'gps':     {'classic': 'gps',         'gz': 'navsat'},
+    'contact': {'classic': 'contact',     'gz': 'contact'},
+}
 
 
-def generate_sensor_link_urdf(sensor, indent='  '):
-    """
-    Generate URDF link element for a sensor
+def _pose_str(sensor):
+    vals = list(sensor['xyz']) + list(sensor['rpy'])
+    return ' '.join(str(v) for v in vals)
 
-    Parameters
-    ----------
-    sensor : dict
-        Sensor configuration
-    indent : str
-        Indentation string
 
-    Returns
-    -------
-    str : URDF XML for sensor link
-    """
+def _add_payload(sensor_el, sensor):
+    """Add the type-specific child block (camera/ray/imu...) to <sensor>."""
+    stype = sensor['type']
+    p = sensor['params']
+
+    if stype in ('camera', 'depth'):
+        cam = SubElement(sensor_el, 'camera')
+        SubElement(cam, 'horizontal_fov').text = str(p['horizontal_fov'])
+        image = SubElement(cam, 'image')
+        SubElement(image, 'width').text = str(p['width'])
+        SubElement(image, 'height').text = str(p['height'])
+        SubElement(image, 'format').text = 'R8G8B8' if stype == 'camera' else 'L8'
+        clip = SubElement(cam, 'clip')
+        SubElement(clip, 'near').text = str(p['near'])
+        SubElement(clip, 'far').text = str(p['far'])
+
+    elif stype == 'lidar':
+        ray = SubElement(sensor_el, 'ray')
+        scan = SubElement(ray, 'scan')
+        hz = SubElement(scan, 'horizontal')
+        SubElement(hz, 'samples').text = str(p['samples'])
+        SubElement(hz, 'resolution').text = '1'
+        SubElement(hz, 'min_angle').text = str(p['min_angle'])
+        SubElement(hz, 'max_angle').text = str(p['max_angle'])
+        rng = SubElement(ray, 'range')
+        SubElement(rng, 'min').text = str(p['range_min'])
+        SubElement(rng, 'max').text = str(p['range_max'])
+        SubElement(rng, 'resolution').text = '0.01'
+
+    elif stype == 'imu':
+        SubElement(sensor_el, 'imu')
+
+    elif stype == 'gps':
+        SubElement(sensor_el, 'gps')
+
+    elif stype == 'contact':
+        contact = SubElement(sensor_el, 'contact')
+        SubElement(contact, 'collision').text = '__default__'
+
+
+def _add_classic_plugin(sensor_el, sensor):
+    """Add a Gazebo-classic gazebo_ros plugin (ROS1)."""
+    stype = sensor['type']
     name = sensor['name']
+    if stype in ('camera', 'depth'):
+        fn = 'libgazebo_ros_camera.so'
+    elif stype == 'lidar':
+        fn = 'libgazebo_ros_ray_sensor.so'
+    elif stype == 'imu':
+        fn = 'libgazebo_ros_imu_sensor.so'
+    elif stype == 'gps':
+        fn = 'libgazebo_ros_gps_sensor.so'
+    else:
+        return
+    plugin = SubElement(sensor_el, 'plugin')
+    plugin.set('name', name + '_plugin')
+    plugin.set('filename', fn)
+    ros = SubElement(plugin, 'ros')
+    SubElement(ros, 'namespace').text = '/'
+    SubElement(plugin, 'frame_name').text = sensor['link']
 
-    xml = f'{indent}<link name="{name}_link">\n'
-    xml += f'{indent}  <visual>\n'
-    xml += f'{indent}    <geometry>\n'
-    xml += f'{indent}      <box size="0.01 0.01 0.01"/>\n'
-    xml += f'{indent}    </geometry>\n'
-    xml += f'{indent}  </visual>\n'
-    xml += f'{indent}</link>\n'
 
-    return xml
-
-
-def generate_sensor_joint_urdf(sensor, indent='  '):
+def make_urdf_sensor_xml(sensor, ros_version='ros2'):
     """
-    Generate URDF joint element to attach sensor to parent link
-
-    Parameters
-    ----------
-    sensor : dict
-        Sensor configuration
-    indent : str
-        Indentation string
-
-    Returns
-    -------
-    str : URDF XML for sensor joint
+    Build a '<gazebo reference="link"><sensor>...</sensor></gazebo>' XML string
+    for one sensor. ros_version: 'ros1' (Gazebo classic plugins) or 'ros2'
+    (new Gz; sensors driven by the gz sensors system, bridged via ros_gz).
     """
-    name = sensor['name']
-    parent = sensor.get('parent_link', 'base_link')
-    pose = sensor.get('pose', {})
-    xyz = pose.get('xyz', [0, 0, 0])
-    rpy = pose.get('rpy', [0, 0, 0])
+    if 'error' in sensor:
+        return f'<!-- sensor error: {sensor["error"]} -->\n'
 
-    xyz_str = ' '.join(str(v) for v in xyz)
-    rpy_str = ' '.join(str(v) for v in rpy)
+    target = 'classic' if ros_version == 'ros1' else 'gz'
+    gazebo = Element('gazebo')
+    gazebo.set('reference', sensor['link'])
 
-    xml = f'{indent}<joint name="{name}_joint" type="fixed">\n'
-    xml += f'{indent}  <parent link="{parent}"/>\n'
-    xml += f'{indent}  <child link="{name}_link"/>\n'
-    xml += f'{indent}  <origin xyz="{xyz_str}" rpy="{rpy_str}"/>\n'
-    xml += f'{indent}</joint>\n'
+    sensor_el = SubElement(gazebo, 'sensor')
+    sensor_el.set('name', sensor['name'])
+    sensor_el.set('type', _TYPE_STR[sensor['type']][target])
 
-    return xml
+    SubElement(sensor_el, 'always_on').text = '1'
+    SubElement(sensor_el, 'update_rate').text = str(sensor['params'].get('update_rate', 30))
+    SubElement(sensor_el, 'visualize').text = 'true'
+    SubElement(sensor_el, 'pose').text = _pose_str(sensor)
+    SubElement(sensor_el, 'topic').text = sensor['name']
 
+    _add_payload(sensor_el, sensor)
 
-def generate_camera_gazebo_urdf(sensor, indent='  '):
-    """Generate Gazebo camera plugin URDF"""
-    name = sensor['name']
-    params = sensor.get('params', {})
+    if ros_version == 'ros1':
+        _add_classic_plugin(sensor_el, sensor)
 
-    width = params.get('width', 640)
-    height = params.get('height', 480)
-    fov = params.get('fov', 1.047)
-    update_rate = params.get('update_rate', 30.0)
-    clip = params.get('clip', {'near': 0.1, 'far': 100.0})
-    noise = params.get('noise', {'type': 'gaussian', 'mean': 0.0, 'stddev': 0.007})
-
-    xml = f'{indent}<gazebo reference="{name}_link">\n'
-    xml += f'{indent}  <sensor type="camera" name="{name}">\n'
-    xml += f'{indent}    <update_rate>{update_rate}</update_rate>\n'
-    xml += f'{indent}    <camera name="{name}_camera">\n'
-    xml += f'{indent}      <horizontal_fov>{fov}</horizontal_fov>\n'
-    xml += f'{indent}      <image>\n'
-    xml += f'{indent}        <width>{width}</width>\n'
-    xml += f'{indent}        <height>{height}</height>\n'
-    xml += f'{indent}        <format>R8G8B8</format>\n'
-    xml += f'{indent}      </image>\n'
-    xml += f'{indent}      <clip>\n'
-    xml += f'{indent}        <near>{clip["near"]}</near>\n'
-    xml += f'{indent}        <far>{clip["far"]}</far>\n'
-    xml += f'{indent}      </clip>\n'
-    xml += f'{indent}      <noise>\n'
-    xml += f'{indent}        <type>{noise["type"]}</type>\n'
-    xml += f'{indent}        <mean>{noise["mean"]}</mean>\n'
-    xml += f'{indent}        <stddev>{noise["stddev"]}</stddev>\n'
-    xml += f'{indent}      </noise>\n'
-    xml += f'{indent}    </camera>\n'
-    xml += f'{indent}    <plugin name="{name}_controller" filename="libgazebo_ros_camera.so">\n'
-    xml += f'{indent}      <ros>\n'
-    xml += f'{indent}        <namespace>/</namespace>\n'
-    xml += f'{indent}        <remapping>image_raw:={name}/image_raw</remapping>\n'
-    xml += f'{indent}        <remapping>camera_info:={name}/camera_info</remapping>\n'
-    xml += f'{indent}      </ros>\n'
-    xml += f'{indent}      <camera_name>{name}</camera_name>\n'
-    xml += f'{indent}      <frame_name>{name}_link</frame_name>\n'
-    xml += f'{indent}    </plugin>\n'
-    xml += f'{indent}  </sensor>\n'
-    xml += f'{indent}</gazebo>\n'
-
-    return xml
+    rough = tostring(gazebo, 'utf-8')
+    pretty = minidom.parseString(rough).toprettyxml(indent='  ')
+    return '\n'.join(pretty.split('\n')[1:])  # drop the <?xml ?> header
 
 
-def generate_depth_camera_gazebo_urdf(sensor, indent='  '):
-    """Generate Gazebo depth camera plugin URDF"""
-    name = sensor['name']
-    params = sensor.get('params', {})
-
-    width = params.get('width', 640)
-    height = params.get('height', 480)
-    fov = params.get('fov', 1.047)
-    update_rate = params.get('update_rate', 30.0)
-    clip = params.get('clip', {'near': 0.1, 'far': 10.0})
-
-    xml = f'{indent}<gazebo reference="{name}_link">\n'
-    xml += f'{indent}  <sensor type="depth" name="{name}">\n'
-    xml += f'{indent}    <update_rate>{update_rate}</update_rate>\n'
-    xml += f'{indent}    <camera name="{name}_camera">\n'
-    xml += f'{indent}      <horizontal_fov>{fov}</horizontal_fov>\n'
-    xml += f'{indent}      <image>\n'
-    xml += f'{indent}        <width>{width}</width>\n'
-    xml += f'{indent}        <height>{height}</height>\n'
-    xml += f'{indent}        <format>R8G8B8</format>\n'
-    xml += f'{indent}      </image>\n'
-    xml += f'{indent}      <clip>\n'
-    xml += f'{indent}        <near>{clip["near"]}</near>\n'
-    xml += f'{indent}        <far>{clip["far"]}</far>\n'
-    xml += f'{indent}      </clip>\n'
-    xml += f'{indent}    </camera>\n'
-    xml += f'{indent}    <plugin name="{name}_controller" filename="libgazebo_ros_camera.so">\n'
-    xml += f'{indent}      <ros>\n'
-    xml += f'{indent}        <namespace>/</namespace>\n'
-    xml += f'{indent}        <remapping>image_raw:={name}/image_raw</remapping>\n'
-    xml += f'{indent}        <remapping>depth/image_raw:={name}/depth/image_raw</remapping>\n'
-    xml += f'{indent}        <remapping>points:={name}/points</remapping>\n'
-    xml += f'{indent}        <remapping>camera_info:={name}/camera_info</remapping>\n'
-    xml += f'{indent}      </ros>\n'
-    xml += f'{indent}      <camera_name>{name}</camera_name>\n'
-    xml += f'{indent}      <frame_name>{name}_link</frame_name>\n'
-    xml += f'{indent}      <min_depth>{clip["near"]}</min_depth>\n'
-    xml += f'{indent}      <max_depth>{clip["far"]}</max_depth>\n'
-    xml += f'{indent}    </plugin>\n'
-    xml += f'{indent}  </sensor>\n'
-    xml += f'{indent}</gazebo>\n'
-
-    return xml
-
-
-def generate_lidar_gazebo_urdf(sensor, indent='  '):
-    """Generate Gazebo lidar/ray plugin URDF"""
-    name = sensor['name']
-    params = sensor.get('params', {})
-
-    samples = params.get('samples', 360)
-    resolution = params.get('resolution', 1.0)
-    update_rate = params.get('update_rate', 10.0)
-    range_config = params.get('range', {'min': 0.1, 'max': 10.0})
-    angle_config = params.get('angle', {'min': -3.14159, 'max': 3.14159})
-    noise = params.get('noise', {'type': 'gaussian', 'mean': 0.0, 'stddev': 0.01})
-
-    xml = f'{indent}<gazebo reference="{name}_link">\n'
-    xml += f'{indent}  <sensor type="ray" name="{name}">\n'
-    xml += f'{indent}    <pose>0 0 0 0 0 0</pose>\n'
-    xml += f'{indent}    <visualize>true</visualize>\n'
-    xml += f'{indent}    <update_rate>{update_rate}</update_rate>\n'
-    xml += f'{indent}    <ray>\n'
-    xml += f'{indent}      <scan>\n'
-    xml += f'{indent}        <horizontal>\n'
-    xml += f'{indent}          <samples>{samples}</samples>\n'
-    xml += f'{indent}          <resolution>{resolution}</resolution>\n'
-    xml += f'{indent}          <min_angle>{angle_config["min"]}</min_angle>\n'
-    xml += f'{indent}          <max_angle>{angle_config["max"]}</max_angle>\n'
-    xml += f'{indent}        </horizontal>\n'
-    xml += f'{indent}      </scan>\n'
-    xml += f'{indent}      <range>\n'
-    xml += f'{indent}        <min>{range_config["min"]}</min>\n'
-    xml += f'{indent}        <max>{range_config["max"]}</max>\n'
-    xml += f'{indent}        <resolution>0.01</resolution>\n'
-    xml += f'{indent}      </range>\n'
-    xml += f'{indent}      <noise>\n'
-    xml += f'{indent}        <type>{noise["type"]}</type>\n'
-    xml += f'{indent}        <mean>{noise["mean"]}</mean>\n'
-    xml += f'{indent}        <stddev>{noise["stddev"]}</stddev>\n'
-    xml += f'{indent}      </noise>\n'
-    xml += f'{indent}    </ray>\n'
-    xml += f'{indent}    <plugin name="{name}_controller" filename="libgazebo_ros_ray_sensor.so">\n'
-    xml += f'{indent}      <ros>\n'
-    xml += f'{indent}        <namespace>/</namespace>\n'
-    xml += f'{indent}        <remapping>~/out:={name}/scan</remapping>\n'
-    xml += f'{indent}      </ros>\n'
-    xml += f'{indent}      <output_type>sensor_msgs/LaserScan</output_type>\n'
-    xml += f'{indent}      <frame_name>{name}_link</frame_name>\n'
-    xml += f'{indent}    </plugin>\n'
-    xml += f'{indent}  </sensor>\n'
-    xml += f'{indent}</gazebo>\n'
-
-    return xml
-
-
-def generate_imu_gazebo_urdf(sensor, indent='  '):
-    """Generate Gazebo IMU plugin URDF"""
-    name = sensor['name']
-    params = sensor.get('params', {})
-
-    update_rate = params.get('update_rate', 100.0)
-    accel_noise = params.get('accel_noise', {'mean': 0.0, 'stddev': 0.01})
-    gyro_noise = params.get('gyro_noise', {'mean': 0.0, 'stddev': 0.01})
-
-    xml = f'{indent}<gazebo reference="{name}_link">\n'
-    xml += f'{indent}  <sensor type="imu" name="{name}">\n'
-    xml += f'{indent}    <always_on>true</always_on>\n'
-    xml += f'{indent}    <update_rate>{update_rate}</update_rate>\n'
-    xml += f'{indent}    <imu>\n'
-    xml += f'{indent}      <angular_velocity>\n'
-    xml += f'{indent}        <x>\n'
-    xml += f'{indent}          <noise type="gaussian">\n'
-    xml += f'{indent}            <mean>{gyro_noise["mean"]}</mean>\n'
-    xml += f'{indent}            <stddev>{gyro_noise["stddev"]}</stddev>\n'
-    xml += f'{indent}          </noise>\n'
-    xml += f'{indent}        </x>\n'
-    xml += f'{indent}        <y>\n'
-    xml += f'{indent}          <noise type="gaussian">\n'
-    xml += f'{indent}            <mean>{gyro_noise["mean"]}</mean>\n'
-    xml += f'{indent}            <stddev>{gyro_noise["stddev"]}</stddev>\n'
-    xml += f'{indent}          </noise>\n'
-    xml += f'{indent}        </y>\n'
-    xml += f'{indent}        <z>\n'
-    xml += f'{indent}          <noise type="gaussian">\n'
-    xml += f'{indent}            <mean>{gyro_noise["mean"]}</mean>\n'
-    xml += f'{indent}            <stddev>{gyro_noise["stddev"]}</stddev>\n'
-    xml += f'{indent}          </noise>\n'
-    xml += f'{indent}        </z>\n'
-    xml += f'{indent}      </angular_velocity>\n'
-    xml += f'{indent}      <linear_acceleration>\n'
-    xml += f'{indent}        <x>\n'
-    xml += f'{indent}          <noise type="gaussian">\n'
-    xml += f'{indent}            <mean>{accel_noise["mean"]}</mean>\n'
-    xml += f'{indent}            <stddev>{accel_noise["stddev"]}</stddev>\n'
-    xml += f'{indent}          </noise>\n'
-    xml += f'{indent}        </x>\n'
-    xml += f'{indent}        <y>\n'
-    xml += f'{indent}          <noise type="gaussian">\n'
-    xml += f'{indent}            <mean>{accel_noise["mean"]}</mean>\n'
-    xml += f'{indent}            <stddev>{accel_noise["stddev"]}</stddev>\n'
-    xml += f'{indent}          </noise>\n'
-    xml += f'{indent}        </y>\n'
-    xml += f'{indent}        <z>\n'
-    xml += f'{indent}          <noise type="gaussian">\n'
-    xml += f'{indent}            <mean>{accel_noise["mean"]}</mean>\n'
-    xml += f'{indent}            <stddev>{accel_noise["stddev"]}</stddev>\n'
-    xml += f'{indent}          </noise>\n'
-    xml += f'{indent}        </z>\n'
-    xml += f'{indent}      </linear_acceleration>\n'
-    xml += f'{indent}    </imu>\n'
-    xml += f'{indent}    <plugin name="{name}_controller" filename="libgazebo_ros_imu_sensor.so">\n'
-    xml += f'{indent}      <ros>\n'
-    xml += f'{indent}        <namespace>/</namespace>\n'
-    xml += f'{indent}        <remapping>~/out:={name}/data</remapping>\n'
-    xml += f'{indent}      </ros>\n'
-    xml += f'{indent}      <frame_name>{name}_link</frame_name>\n'
-    xml += f'{indent}    </plugin>\n'
-    xml += f'{indent}  </sensor>\n'
-    xml += f'{indent}</gazebo>\n'
-
-    return xml
-
-
-def generate_sensor_gazebo_urdf(sensor, indent='  '):
+def make_sdf_sensor_element(sensor):
     """
-    Generate Gazebo sensor plugin XML based on sensor type
-
-    Parameters
-    ----------
-    sensor : dict
-        Sensor configuration
-    indent : str
-        Indentation string
-
-    Returns
-    -------
-    str : URDF/Gazebo XML for sensor
+    Build an ElementTree <sensor> Element for SDF (to be appended to the parent
+    <link>). The pose is relative to the link frame. Returns None on error.
     """
-    sensor_type = sensor.get('type', 'camera')
+    if 'error' in sensor:
+        return None
 
-    generators = {
-        'camera': generate_camera_gazebo_urdf,
-        'depth_camera': generate_depth_camera_gazebo_urdf,
-        'lidar': generate_lidar_gazebo_urdf,
-        'ray': generate_lidar_gazebo_urdf,
-        'imu': generate_imu_gazebo_urdf,
-    }
-
-    generator = generators.get(sensor_type)
-    if generator:
-        return generator(sensor, indent)
-
-    return f'{indent}<!-- Sensor type "{sensor_type}" not supported yet -->\n'
-
-
-def generate_sensors_urdf(sensors, indent='  '):
-    """
-    Generate complete URDF XML for all sensors (links + joints)
-
-    Parameters
-    ----------
-    sensors : list
-        List of sensor configurations
-    indent : str
-        Indentation string
-
-    Returns
-    -------
-    str : Complete URDF XML for all sensors
-    """
-    if not sensors:
-        return ''
-
-    xml = f'\n{indent}<!-- Sensors -->\n'
-
-    for sensor in sensors:
-        xml += generate_sensor_link_urdf(sensor, indent)
-        xml += generate_sensor_joint_urdf(sensor, indent)
-
-    return xml
-
-
-def generate_sensors_gazebo_urdf(sensors, indent='  '):
-    """
-    Generate complete Gazebo plugin XML for all sensors
-
-    Parameters
-    ----------
-    sensors : list
-        List of sensor configurations
-    indent : str
-        Indentation string
-
-    Returns
-    -------
-    str : Complete Gazebo XML for all sensors
-    """
-    if not sensors:
-        return ''
-
-    xml = f'\n{indent}<!-- Sensor Plugins -->\n'
-
-    for sensor in sensors:
-        xml += generate_sensor_gazebo_urdf(sensor, indent)
-
-    return xml
-
-
-# SDF generation functions
-
-def generate_sensor_sdf(sensor, indent='      '):
-    """
-    Generate SDF sensor element
-
-    Parameters
-    ----------
-    sensor : dict
-        Sensor configuration
-    indent : str
-        Indentation string
-
-    Returns
-    -------
-    str : SDF XML for sensor
-    """
-    sensor_type = sensor.get('type', 'camera')
-    name = sensor['name']
-    params = sensor.get('params', {})
-    pose = sensor.get('pose', {})
-    xyz = pose.get('xyz', [0, 0, 0])
-    rpy = pose.get('rpy', [0, 0, 0])
-
-    pose_str = ' '.join(str(v) for v in xyz + rpy)
-    update_rate = params.get('update_rate', 30.0)
-
-    xml = f'{indent}<sensor name="{name}" type="{sensor_type}">\n'
-    xml += f'{indent}  <pose>{pose_str}</pose>\n'
-    xml += f'{indent}  <always_on>true</always_on>\n'
-    xml += f'{indent}  <update_rate>{update_rate}</update_rate>\n'
-
-    if sensor_type == 'camera':
-        xml += generate_camera_sdf_content(params, indent + '  ')
-    elif sensor_type == 'depth_camera':
-        xml += generate_depth_camera_sdf_content(params, indent + '  ')
-    elif sensor_type in ('lidar', 'ray'):
-        xml += generate_lidar_sdf_content(params, indent + '  ')
-    elif sensor_type == 'imu':
-        xml += generate_imu_sdf_content(params, indent + '  ')
-
-    xml += f'{indent}</sensor>\n'
-
-    return xml
-
-
-def generate_camera_sdf_content(params, indent):
-    """Generate camera-specific SDF content"""
-    width = params.get('width', 640)
-    height = params.get('height', 480)
-    fov = params.get('fov', 1.047)
-    clip = params.get('clip', {'near': 0.1, 'far': 100.0})
-
-    xml = f'{indent}<camera>\n'
-    xml += f'{indent}  <horizontal_fov>{fov}</horizontal_fov>\n'
-    xml += f'{indent}  <image>\n'
-    xml += f'{indent}    <width>{width}</width>\n'
-    xml += f'{indent}    <height>{height}</height>\n'
-    xml += f'{indent}    <format>R8G8B8</format>\n'
-    xml += f'{indent}  </image>\n'
-    xml += f'{indent}  <clip>\n'
-    xml += f'{indent}    <near>{clip["near"]}</near>\n'
-    xml += f'{indent}    <far>{clip["far"]}</far>\n'
-    xml += f'{indent}  </clip>\n'
-    xml += f'{indent}</camera>\n'
-
-    return xml
-
-
-def generate_depth_camera_sdf_content(params, indent):
-    """Generate depth camera-specific SDF content"""
-    return generate_camera_sdf_content(params, indent)
-
-
-def generate_lidar_sdf_content(params, indent):
-    """Generate lidar/ray-specific SDF content"""
-    samples = params.get('samples', 360)
-    resolution = params.get('resolution', 1.0)
-    range_config = params.get('range', {'min': 0.1, 'max': 10.0})
-    angle_config = params.get('angle', {'min': -3.14159, 'max': 3.14159})
-
-    xml = f'{indent}<ray>\n'
-    xml += f'{indent}  <scan>\n'
-    xml += f'{indent}    <horizontal>\n'
-    xml += f'{indent}      <samples>{samples}</samples>\n'
-    xml += f'{indent}      <resolution>{resolution}</resolution>\n'
-    xml += f'{indent}      <min_angle>{angle_config["min"]}</min_angle>\n'
-    xml += f'{indent}      <max_angle>{angle_config["max"]}</max_angle>\n'
-    xml += f'{indent}    </horizontal>\n'
-    xml += f'{indent}  </scan>\n'
-    xml += f'{indent}  <range>\n'
-    xml += f'{indent}    <min>{range_config["min"]}</min>\n'
-    xml += f'{indent}    <max>{range_config["max"]}</max>\n'
-    xml += f'{indent}    <resolution>0.01</resolution>\n'
-    xml += f'{indent}  </range>\n'
-    xml += f'{indent}</ray>\n'
-
-    return xml
-
-
-def generate_imu_sdf_content(params, indent):
-    """Generate IMU-specific SDF content"""
-    xml = f'{indent}<imu>\n'
-    xml += f'{indent}  <orientation_reference_frame>\n'
-    xml += f'{indent}    <localization>ENU</localization>\n'
-    xml += f'{indent}  </orientation_reference_frame>\n'
-    xml += f'{indent}</imu>\n'
-
-    return xml
-
-
-def generate_sensors_for_link_sdf(sensors, link_name, indent='      '):
-    """
-    Generate SDF sensors for a specific link
-
-    Parameters
-    ----------
-    sensors : list
-        List of all sensor configurations
-    link_name : str
-        Name of the parent link
-    indent : str
-        Indentation string
-
-    Returns
-    -------
-    str : SDF XML for sensors attached to this link
-    """
-    link_sensors = [s for s in sensors if s.get('parent_link', 'base_link') == link_name]
-
-    if not link_sensors:
-        return ''
-
-    xml = ''
-    for sensor in link_sensors:
-        xml += generate_sensor_sdf(sensor, indent)
-
-    return xml
+    sensor_el = Element('sensor')
+    sensor_el.set('name', sensor['name'])
+    sensor_el.set('type', _TYPE_STR[sensor['type']]['gz'])
+    SubElement(sensor_el, 'always_on').text = '1'
+    SubElement(sensor_el, 'update_rate').text = str(sensor['params'].get('update_rate', 30))
+    SubElement(sensor_el, 'visualize').text = 'true'
+    SubElement(sensor_el, 'pose').text = _pose_str(sensor)
+    SubElement(sensor_el, 'topic').text = sensor['name']
+    _add_payload(sensor_el, sensor)
+    return sensor_el

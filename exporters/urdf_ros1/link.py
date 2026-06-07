@@ -8,6 +8,7 @@ import adsk
 import re
 from xml.etree.ElementTree import Element, SubElement
 from . import utils
+from ...core import sensors as core_sensors
 
 
 class Link:
@@ -82,7 +83,7 @@ class Link:
         self.link_xml = "\n".join(utils.prettify(link).split("\n")[1:])
 
 
-def make_inertial_dict(root, msg, base_link_name=None):
+def make_inertial_dict(root, msg, base_link_name=None, progress=None):
     """
     Generate inertial dictionary from Fusion design
 
@@ -91,6 +92,7 @@ def make_inertial_dict(root, msg, base_link_name=None):
     root: adsk.fusion.Component - Root component
     msg: str - Status message
     base_link_name: str - Name of the occurrence to use as base_link (optional)
+    progress: ProgressReporter - optional progress window (one step per link)
 
     Returns
     ----------
@@ -101,12 +103,21 @@ def make_inertial_dict(root, msg, base_link_name=None):
 
     def process_occurrences(occurrences):
         for occs in occurrences:
+            if progress is not None and progress.is_cancelled():
+                return
+
+            # Sensor mounts are not links.
+            if core_sensors.is_sensor_occurrence(occs):
+                continue
+
             # Skip if no bodies (subassembly container)
             if occs.bRepBodies.count == 0 and occs.childOccurrences.count > 0:
                 process_occurrences(occs.childOccurrences)
                 continue
 
             occs_dict = {}
+            if progress is not None:
+                progress.step(utils.normalize_name(occs.name))
             prop = occs.getPhysicalProperties(adsk.fusion.CalculationAccuracy.VeryHighCalculationAccuracy)
 
             occs_dict['name'] = utils.normalize_name(occs.name)

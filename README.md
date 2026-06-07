@@ -36,7 +36,8 @@ O script copia os arquivos para `%APPDATA%\Autodesk\Autodesk Fusion 360\API\Scri
 4. Configurar opções na UI:
    - **Format**: URDF ou SDF
    - **ROS Version**: ROS1 ou ROS2 (apenas para URDF)
-   - **Base Link**: componente raiz do robô
+   - **Base Link**: componente/grupo raiz do robô
+   - **Define links by Rigid Group**: alterna o modo de definição de links
    - **Export Options**: meshes, collision, inertia, launch files
    - **Mesh Options**: formato (STL/OBJ), tipo de colisão
 
@@ -91,90 +92,144 @@ output_dir/
     └── *.obj
 ```
 
+## Modos de Link
+
+O checkbox **Define links by Rigid Group** define como os links são montados:
+
+| Modo | Comportamento |
+|------|---------------|
+| **Components** (padrão) | Cada componente vira um link. |
+| **Rigid Groups** | Cada Rigid Group **do nível principal da montagem** vira **um link fundido** (todos os bodies das ocorrências do grupo juntos). Rigid groups definidos dentro de submontagens são **ignorados**; componentes fora de qualquer grupo também são **ignorados**. |
+
+Use o modo **Rigid Groups** quando quiser tratar uma submontagem inteira como um
+único link — por exemplo, agrupar várias peças do chassi em um rigid group e
+exportá-lo como `base_link`. Nesse modo o dropdown **Base Link** lista os rigid
+groups; as juntas do Fusion entre peças de grupos diferentes viram as juntas
+entre os links.
+
 ## Sensores
 
-Sensores podem ser adicionados ao modelo exportado através de um arquivo `sensors.json`.
-Coloque o arquivo na pasta de destino antes de exportar, ou no diretório pai.
+Sensores são adicionados criando um **componente** na montagem com nome no
+formato (separador é **duplo underscore** `__`):
 
-### Exemplo: sensors.json
-
-```json
-{
-  "sensors": [
-    {
-      "name": "camera_front",
-      "type": "camera",
-      "parent_link": "base_link",
-      "pose": {
-        "xyz": [0.1, 0, 0.05],
-        "rpy": [0, 0, 0]
-      },
-      "params": {
-        "width": 640,
-        "height": 480,
-        "fov": 1.047,
-        "clip": {"near": 0.1, "far": 100.0}
-      }
-    },
-    {
-      "name": "lidar_top",
-      "type": "lidar",
-      "parent_link": "base_link",
-      "pose": {
-        "xyz": [0, 0, 0.15],
-        "rpy": [0, 0, 0]
-      },
-      "params": {
-        "samples": 360,
-        "range": {"min": 0.1, "max": 10.0}
-      }
-    },
-    {
-      "name": "imu",
-      "type": "imu",
-      "parent_link": "base_link",
-      "pose": {
-        "xyz": [0, 0, 0.02],
-        "rpy": [0, 0, 0]
-      }
-    }
-  ]
-}
+```
+sensor__<tipo>__<link>__<nome>
 ```
 
-### Tipos de Sensores
+- `<tipo>`: `camera`, `depth`, `lidar`, `imu`, `gps`, `contact`
+- `<link>`: link onde o sensor monta (ex.: `base_link`)
+- `<nome>`: opcional (default = tipo)
 
-| Tipo | Descrição | Parâmetros |
-|------|-----------|------------|
-| `camera` | Câmera RGB | width, height, fov, clip, update_rate |
-| `depth_camera` | Câmera de profundidade | width, height, fov, clip |
-| `lidar` | Sensor laser 2D (LiDAR) | samples, range, angle, resolution |
-| `imu` | Unidade de medição inercial | update_rate, noise |
+Exemplos: `sensor__camera__base_link__frontal`, `sensor__lidar__base_link__topo`,
+`sensor__imu__base_link`.
 
-### Parâmetros de Câmera
+A pose e a orientação do sensor são tiradas do transform do componente relativo
+ao link (oriente o frame do componente para onde a câmera/LiDAR aponta). O
+componente em si **não** vira link nem gera mesh. Gera blocos `<sensor>` para
+SDF/Gazebo e `<gazebo><sensor>` para URDF (ROS1 = gazebo_ros classic, ROS2 = Gz).
 
-| Parâmetro | Descrição | Padrão |
-|-----------|-----------|--------|
-| `width` | Largura da imagem (pixels) | 640 |
-| `height` | Altura da imagem (pixels) | 480 |
-| `fov` | Campo de visão horizontal (radianos) | 1.047 (~60°) |
-| `clip.near` | Distância mínima visível (m) | 0.1 |
-| `clip.far` | Distância máxima visível (m) | 100.0 |
-| `update_rate` | Frequência de atualização (Hz) | 30.0 |
+Cada tipo tem defaults razoáveis (FOV, resolução, alcance, `update_rate`) — ver
+`SENSOR_DEFAULTS` em `core/sensors.py`.
 
-### Parâmetros de Pose
+### Sensores × "Define links by Rigid Group"
 
-- `xyz`: posição [x, y, z] em metros, relativa ao `parent_link`
-- `rpy`: orientação [roll, pitch, yaw] em radianos
+O `<link>` no nome do sensor **sempre** se refere a um nome de link do URDF/SDF
+gerado — e quais nomes existem depende do modo de link. O componente do sensor é
+sempre localizado pelo **nome** (varredura recursiva da montagem); ele **não
+precisa** estar dentro de nenhum rigid group. O que muda entre os modos é (1)
+**quais nomes de `<link>` são válidos** e (2) **em relação a qual frame a pose do
+sensor é calculada**:
 
-Um arquivo de exemplo está disponível em `sensors.example.json`.
+**Checkbox DESMARCADO — modo Components (um componente = um link):**
+
+- `<link>` deve ser o nome de um **componente** que virou link, ou seja, o nome
+  da ocorrência normalizado (`normalize_name`), ou `base_link` para o componente
+  base escolhido no dropdown.
+- A pose do sensor é calculada **relativa ao frame do componente** daquele link
+  (`T_link⁻¹ · T_sensor`, onde `T_link` é o transform de mundo da ocorrência).
+- Mapa link→frame montado por `build_component_link_transforms`.
+- Ex.: se a perna do robô é o componente `perna_dir`, use
+  `sensor__contact__perna_dir__pe`.
+
+**Checkbox MARCADO — modo Rigid Groups (um rigid group = um link fundido):**
+
+- `<link>` deve ser o nome de um **rigid group** (do nível principal da montagem)
+  normalizado, ou `base_link` para o rigid group base selecionado no dropdown.
+  Componentes individuais **não** são links neste modo, então nomes de componente
+  não casam — use o nome do grupo.
+- A pose do sensor é calculada relativa ao **frame do link de grupo**, que é
+  alinhado ao mundo e transladado para o ponto da junta `P` daquele link (a mesma
+  convenção da mesh/junta), **não** ao frame de um componente específico. Mapa
+  link→frame montado por `build_rigid_link_transforms` a partir dos `link_frames`.
+- O componente do sensor pode estar solto (fora de qualquer rigid group) — mesmo
+  sendo ignorado como link, ele continua sendo detectado como sensor pelo nome.
+- Ex.: se o rigid group `rotor_1` virou um link, use
+  `sensor__imu__rotor_1__medidor`.
+
+Em ambos os modos, se o `<link>` informado não existir entre os links gerados, o
+sensor é pulado e um aviso aparece no painel **Text Commands**
+(`Sensor warning: ... link '<x>' not found`). Confira lá após exportar.
 
 ## Requisitos do Modelo Fusion 360
 
-- Cada **link** deve ser um **componente separado**
+- Cada **link** deve ser um **componente separado** (modo Components) ou um
+  **Rigid Group** (modo Rigid Groups)
 - **Joints** conectam componentes (Revolute, Prismatic, Fixed)
 - Componentes não devem ter subcomponentes aninhados
 - Convenção de joints: Parent = Component2, Child = Component1
+
+## Visualizador URDF/SDF (Docker)
+
+Um container Docker com app Flask renderiza no navegador o URDF/SDF de um pacote
+gerado (e, numa etapa futura, fará simplificação de malha). Os scripts ficam em
+`meshSimplification/` e o `Dockerfile` em `docker/`.
+
+```bat
+REM 1) buildar a imagem (uma vez)
+build.bat
+
+REM 2) subir o Flask (sem precisar apontar a pasta na linha de comando)
+run.bat
+REM   base opcional (default = seu perfil de usuário) e porta:
+REM     run.bat C:\Users\Administrador\Desktop
+REM     run.bat C:\Users\Administrador\Desktop 8080
+```
+
+Abra `http://localhost:5000`. A pasta base é montada em `/data`. Clique em
+**“Open URDF / SDF…”** para abrir uma **janela de browser** (modal) e navegar até
+o `.urdf`/`.xacro`/`.sdf`; ao clicar no arquivo ele é renderizado (STL/OBJ/DAE,
+eixo Z para cima, com OrbitControls). O default monta `%USERPROFILE%`, então
+qualquer pacote gerado sob o seu usuário fica acessível; passe um caminho para
+restringir.
+
+As **joints** também são mostradas no estilo do RViz: em cada junta um **triedro
+RGB** (X=vermelho, Y=verde, Z=azul) na orientação do frame da junta, com um rótulo
+com o **nome da junta**. Controles na lateral:
+- **Show joints** / **Show joint names** — liga/desliga.
+- **Joint name size** — tamanho da fonte do nome (multiplicador).
+- **Frame size** — tamanho do triedro (multiplicador).
+
+Os tamanhos-base escalam pelo bounding box do modelo; os sliders aplicam um
+multiplicador por cima e atualizam ao vivo.
+
+> Ao alterar os scripts em `meshSimplification/`, **rebuilde** a imagem
+> (`build.bat`) antes do `run.bat` — o código é copiado para dentro da imagem no
+> build.
+
+Como funciona: o parsing é **server-side** (`meshSimplification/scene.py`) e
+gera uma "cena" plana (lista de visuais já posicionados no mundo) que o viewer
+Three.js (`static/viewer.js`) só carrega e desenha:
+- **URDF/xacro**: `xacro:include` é inlinado, `$(find pkg)` e `package://pkg/...`
+  resolvem para a raiz do pacote; os frames dos links vêm de FK na configuração
+  zero das juntas; cores vêm de `materials.xacro`.
+- **SDF**: usa os `<pose>` de cada `<link>`/`<visual>` (relativos ao modelo).
+
+Mesh simplification ainda **não** está implementada — o foco atual é só
+renderizar. As deps extras já estão anotadas em `meshSimplification/requirements.txt`.
+
+> Requer Docker Desktop rodando. O `deploy.ps1` **não** copia `docker/`,
+> `meshSimplification/`, `build.bat` nem `run.bat` para o Fusion (não são parte
+> do script).
 
 ## Joints Suportados
 
@@ -190,14 +245,23 @@ Um arquivo de exemplo está disponível em `sensors.example.json`.
 FusionRobotExporter/
 ├── FusionRobotExporter.py    # Entry point + UI
 ├── FusionRobotExporter.manifest
-├── sensors.example.json      # Exemplo de configuração de sensores
 ├── core/
 │   ├── mesh.py               # Exportação STL/OBJ compartilhada
-│   └── sensors.py            # Carregamento e geração de sensores
-└── exporters/
-    ├── urdf_ros1/            # Exportador ROS1
-    ├── urdf_ros2/            # Exportador ROS2
-    └── sdf/                  # Exportador SDF
+│   ├── rigid_groups.py       # Modo "link por Rigid Group"
+│   └── sensors.py            # Sensores por convenção de nome
+├── exporters/
+│   ├── urdf_ros1/            # Exportador ROS1
+│   ├── urdf_ros2/            # Exportador ROS2
+│   └── sdf/                  # Exportador SDF
+├── docker/
+│   └── Dockerfile            # Imagem do visualizador/simplificador
+├── meshSimplification/       # App Flask (render URDF/SDF; simplificação depois)
+│   ├── app.py
+│   ├── scene.py              # URDF/SDF -> cena JSON (server-side)
+│   ├── templates/index.html
+│   └── static/viewer.js      # Viewer Three.js
+├── build.bat                 # Builda a imagem Docker
+└── run.bat                   # Roda o container montando a pasta do pacote
 ```
 
 ## Referências

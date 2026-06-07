@@ -1,0 +1,5 @@
+Flask==3.0.3
+numpy==1.26.4
+# Mesh simplification (added in a later stage) will also use:
+#   trimesh==4.4.3
+#   scipy==1.13.1

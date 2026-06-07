@@ -220,3 +220,151 @@ def make_joints_dict(root, msg, base_link_name=None):
         joints_dict[utils.normalize_name(joint.name)] = joint_dict
 
     return joints_dict, msg
+
+
+# ---------------------------------------------------------------------------
+# Rigid Group link mode
+# ---------------------------------------------------------------------------
+
+_JOINT_TYPE_LIST = [
+    'fixed', 'revolute', 'prismatic', 'Cylinderical', 'PinSlot', 'Planner', 'Ball'
+]
+
+
+def _collect_joints(component):
+    """Collect joints from a component and all of its nested components."""
+    joints = list(component.joints)
+    for occ in component.occurrences:
+        joints.extend(_collect_joints(occ.component))
+    return joints
+
+
+def _joint_point_m(joint):
+    """World position of the joint origin, in METERS."""
+    try:
+        geo = joint.geometryOrOriginOne
+        if geo is not None:
+            return [v / 100.0 for v in geo.origin.asArray()]
+    except:
+        pass
+    try:
+        return [v / 100.0 for v in joint.geometry.origin.asArray()]  # as-built
+    except:
+        pass
+    return [v / 100.0 for v in joint.occurrenceOne.transform.translation.asArray()]
+
+
+def _joint_motion(joint, success_msg):
+    """
+    Extract (type, axis, upper_limit, lower_limit, msg) from a Fusion joint.
+    The axis is left in WORLD coordinates because rigid-group link frames are
+    world-aligned. Limits are shifted by the current (assembled) joint value,
+    mirroring make_joints_dict.
+    """
+    jtype = _JOINT_TYPE_LIST[joint.jointMotion.jointType]
+    axis = [0, 0, 0]
+    upper = 0.0
+    lower = 0.0
+
+    if jtype == 'revolute':
+        axis = [round(i, 6) for i in joint.jointMotion.rotationAxisVector.asArray()]
+        limits = joint.jointMotion.rotationLimits
+        max_enabled = limits.isMaximumValueEnabled
+        min_enabled = limits.isMinimumValueEnabled
+        try:
+            cur = joint.jointMotion.rotationValue
+        except:
+            cur = 0.0
+        if max_enabled and min_enabled:
+            upper = round(limits.maximumValue - cur, 6)
+            lower = round(limits.minimumValue - cur, 6)
+        elif max_enabled and not min_enabled:
+            return jtype, axis, upper, lower, joint.name + ' is not set its lower limit.'
+        elif min_enabled and not max_enabled:
+            return jtype, axis, upper, lower, joint.name + ' is not set its upper limit.'
+        else:
+            jtype = 'continuous'
+
+    elif jtype == 'prismatic':
+        axis = [round(i, 6) for i in joint.jointMotion.slideDirectionVector.asArray()]
+        limits = joint.jointMotion.slideLimits
+        max_enabled = limits.isMaximumValueEnabled
+        min_enabled = limits.isMinimumValueEnabled
+        try:
+            cur = joint.jointMotion.slideValue
+        except:
+            cur = 0.0
+        if max_enabled and min_enabled:
+            upper = round((limits.maximumValue - cur) / 100, 6)
+            lower = round((limits.minimumValue - cur) / 100, 6)
+        elif max_enabled and not min_enabled:
+            return jtype, axis, upper, lower, joint.name + ' is not set its lower limit.'
+        elif min_enabled and not max_enabled:
+            return jtype, axis, upper, lower, joint.name + ' is not set its upper limit.'
+
+    return jtype, axis, upper, lower, success_msg
+
+
+def make_rigid_group_joints_dict(root, occ_to_group, msg):
+    """
+    Build the joints dictionary for the rigid-group link mode.
+
+    Each kept joint connects two different group-links. Joints whose endpoints
+    are loose (not in any group) or fall inside the same group are ignored.
+
+    Returns (joints_dict, link_frames, msg) where link_frames maps every link
+    name to its world-aligned frame translation P (meters); 'base_link' is the
+    world origin.
+    """
+    success_msg = msg
+    joints_dict = {}
+    link_frames = {'base_link': [0.0, 0.0, 0.0]}
+
+    raw = []
+    for joint in _collect_joints(root):
+        occ_one = joint.occurrenceOne
+        occ_two = joint.occurrenceTwo
+        if occ_one is None or occ_two is None:
+            continue
+
+        parent_link = occ_to_group.get(occ_two.name)
+        child_link = occ_to_group.get(occ_one.name)
+        if parent_link is None or child_link is None:
+            continue
+        if parent_link == child_link:
+            continue
+
+        jtype, axis, upper, lower, msg2 = _joint_motion(joint, success_msg)
+        if msg2 != success_msg:
+            return {}, {}, msg2
+
+        point = _joint_point_m(joint)
+        raw.append({
+            'name': utils.normalize_name(joint.name),
+            'parent': parent_link,
+            'child': child_link,
+            'point': point,
+            'type': jtype,
+            'axis': axis,
+            'upper': upper,
+            'lower': lower,
+        })
+        # The child link frame sits at the connecting joint point.
+        link_frames[child_link] = point
+
+    # Second pass: joint origin = P_child - P_parent (both world points).
+    for r in raw:
+        p_parent = link_frames.get(r['parent'], [0.0, 0.0, 0.0])
+        xyz = [round(r['point'][i] - p_parent[i], 6) for i in range(3)]
+        joints_dict[r['name']] = {
+            'type': r['type'],
+            'axis': r['axis'],
+            'upper_limit': r['upper'],
+            'lower_limit': r['lower'],
+            'parent': r['parent'],
+            'child': r['child'],
+            'xyz': xyz,
+            'rpy': [0, 0, 0],
+        }
+
+    return joints_dict, link_frames, msg

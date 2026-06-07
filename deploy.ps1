@@ -30,7 +30,8 @@ Write-Host "Copying files..." -ForegroundColor Cyan
 Copy-Item -Path $SourcePath -Destination $DestinationPath -Recurse -Force
 
 # Remove excluded items from destination
-$excludeItems = @(".git", "deploy.ps1", "deploy.sh", ".gitignore", "__pycache__")
+$excludeItems = @(".git", "deploy.ps1", "deploy.sh", ".gitignore", "__pycache__",
+                  "docker", "meshSimplification", "build.bat", "run.bat")
 foreach ($item in $excludeItems) {
     $itemPath = Join-Path $DestinationPath $item
     if (Test-Path $itemPath) {

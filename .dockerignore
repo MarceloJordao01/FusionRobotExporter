@@ -1,0 +1,8 @@
+# Build context only needs meshSimplification/ (see docker/Dockerfile).
+# Exclude everything else (Fusion script, exporters, generated stuff).
+*
+!meshSimplification
+!meshSimplification/**
+
+# ...but never ship caches even from the included folder.
+**/__pycache__

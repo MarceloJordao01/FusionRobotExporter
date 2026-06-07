@@ -10,7 +10,6 @@ from xml.etree.ElementTree import Element, SubElement
 from . import link as Link
 from . import joint as Joint
 from . import utils
-from ...core import sensors as core_sensors
 
 
 def write_link_urdf(joints_dict, repo, links_xyz_dict, links_rpy_dict, file_name, inertial_dict):
@@ -86,9 +85,8 @@ def write_joint_urdf(joints_dict, repo, links_xyz_dict, file_name):
             f.write('\n')
 
 
-def write_urdf(joints_dict, links_xyz_dict, inertial_dict, package_name, robot_name, save_dir, sensors=None):
+def write_urdf(joints_dict, links_xyz_dict, inertial_dict, package_name, robot_name, save_dir):
     """Write main URDF/XACRO file"""
-    sensors = sensors or []
     links_rpy_dict = {}
 
     try:
@@ -112,10 +110,6 @@ def write_urdf(joints_dict, links_xyz_dict, inertial_dict, package_name, robot_n
     write_joint_urdf(joints_dict, repo, links_xyz_dict, file_name)
 
     with open(file_name, mode='a') as f:
-        # Write sensor links and joints
-        if sensors:
-            f.write(core_sensors.generate_sensors_urdf(sensors))
-
         f.write('</robot>\n')
 
 
@@ -179,8 +173,6 @@ def write_transmissions_xacro(joints_dict, links_xyz_dict, package_name, robot_n
 
 def write_gazebo_xacro(joints_dict, package_name, robot_name, save_dir, sensors=None):
     """Write Gazebo XACRO file"""
-    sensors = sensors or []
-
     try:
         os.mkdir(save_dir + '/urdf')
     except:
@@ -223,9 +215,13 @@ def write_gazebo_xacro(joints_dict, package_name, robot_name, save_dir, sensors=
             f.write('</gazebo>\n')
             f.write('\n')
 
-        # Sensor plugins
+        # Sensors (from sensor__* components in the assembly)
         if sensors:
-            f.write(core_sensors.generate_sensors_gazebo_urdf(sensors))
+            from ...core import sensors as core_sensors
+            f.write('<!-- Sensors -->\n')
+            for sensor in sensors:
+                f.write(core_sensors.make_urdf_sensor_xml(sensor, ros_version='ros1'))
+                f.write('\n')
 
         f.write('</robot>\n')
 

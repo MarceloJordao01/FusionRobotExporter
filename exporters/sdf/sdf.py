@@ -20,14 +20,21 @@ from .link import Link, LinkElement, LinkElementType, LinkGeometry, LinkGeometry
 from .joint import Joint, JointType
 from .pose import Pose
 from ...core.mesh import export_body_to_obj
+from ...core.rigid_groups import merge_occurrence_bodies
 from ...core import sensors as core_sensors
 
 
 class SDF:
-    def __init__(self, design: adsk.fusion.Design, meshes_cache_dir_path: Path = None, sensors: List = None):
+    def __init__(self, design: adsk.fusion.Design, meshes_cache_dir_path: Path = None,
+                 link_mode: str = 'components', base_link_name: str = None, progress=None):
         self.design = design
         self.meshes_cache_dir_path = meshes_cache_dir_path
-        self.sensors = sensors or []
+        # Optional ProgressReporter; one step per link actually created.
+        self.progress = progress
+        # link_mode: 'components' (one component = one link) or 'rigid_groups'
+        # (each rigid group = one merged link; loose components are ignored).
+        self.link_mode = link_mode
+        self.base_link_name = normalize_name(base_link_name) if base_link_name else None
         self.tmp_dir_path: Path = Path(tempfile.mkdtemp())
         self.tmp_meshes_dir_path: Path = self.tmp_dir_path / 'meshes'
         self.name: str = None
@@ -36,6 +43,8 @@ class SDF:
         self.fusion_joints: List[List] = []
         self.occurrences_in_rigid_groups: Dict[str, str] = {}
         self.root_link: str = None
+        # link_name -> world Matrix3D, used to place sensors relative to a link.
+        self.link_world: Dict[str, object] = {}
 
         self.parse_root_component()
 
@@ -44,8 +53,9 @@ class SDF:
         self.name = normalize_name(root_component.name)
         log(f'parse_root_component: {root_component.name}\n')
 
-        for rigid_group in root_component.rigidGroups:
-            self.add_rigid_group(root_component.occurrences, adsk.core.Matrix3D.create(), rigid_group, '')
+        if self.link_mode == 'rigid_groups':
+            for rigid_group in root_component.rigidGroups:
+                self.add_rigid_group(root_component.occurrences, adsk.core.Matrix3D.create(), rigid_group, '')
 
         for occurrence in root_component.occurrences:
             self.parse_occurrence(occurrence, '')
@@ -57,21 +67,54 @@ class SDF:
         for fusion_joint, as_built, prefix in self.fusion_joints:
             self.add_joint(fusion_joint, as_built, prefix)
 
-        links_with_parent_joints = set([joint.child for joint in self.joints.values()])
-        root_links = set(self.links.keys()) - links_with_parent_joints
+        # Pick the root link: honor the user-selected base group in rigid-group
+        # mode, otherwise auto-detect the link that is no joint's child.
+        chosen_root = None
+        if self.link_mode == 'rigid_groups' and self.base_link_name:
+            candidate = self.base_link_name + '_1'
+            if candidate in self.links:
+                chosen_root = candidate
+            else:
+                log(f'WARNING: selected base group "{self.base_link_name}" not found, auto-detecting root\n')
 
-        if len(root_links) == 0:
-            log(f'WARNING: No root link found\n')
+        if chosen_root is not None:
+            self.root_link = chosen_root
         else:
-            if len(root_links) != 1:
-                log(f'WARNING: Multiple root links found: {root_links}\n')
-            self.root_link = next(iter(root_links))
+            links_with_parent_joints = set([joint.child for joint in self.joints.values()])
+            root_links = set(self.links.keys()) - links_with_parent_joints
+
+            if len(root_links) == 0:
+                log(f'WARNING: No root link found\n')
+            else:
+                if len(root_links) != 1:
+                    log(f'WARNING: Multiple root links found: {root_links}\n')
+                self.root_link = next(iter(root_links))
 
         # Add dummy base_link
         self.links['base_link'] = Link('base_link')
         self.links['base_link'].inertial = LinkInertial(Pose(), mass=1e-4, ixx=1e-9, ixy=0, ixz=0, iyy=1e-9, iyz=0, izz=1e-9)
         self.joints['base_link_joint'] = Joint('base_link_joint', JointType.FIXED, None, 'base_link', self.root_link)
         self.root_link = 'base_link'
+        # The dummy base_link sits at the world origin.
+        self.link_world['base_link'] = adsk.core.Matrix3D.create()
+
+        # Attach sensors (sensor__* components) to their target links.
+        self.attach_sensors()
+
+    def attach_sensors(self):
+        """Place sensor__* components on their target links as <sensor> elements."""
+        sensors = core_sensors.collect_sensors(self.design.rootComponent, dict(self.link_world))
+        for s in sensors:
+            if 'error' in s:
+                log(f'Sensor warning: {s["error"]}\n')
+                continue
+            element = core_sensors.make_sdf_sensor_element(s)
+            link = self.links.get(s['link'])
+            if link is None or element is None:
+                log(f'Sensor warning: link "{s.get("link")}" not found for sensor "{s.get("name")}"\n')
+                continue
+            link.sensors.append(element)
+            log(f'Attached sensor "{s["name"]}" ({s["type"]}) to link "{s["link"]}"\n')
 
     def parse_occurrence(self, occurrence: adsk.fusion.Occurrence, prefix: str):
         log(f'parse_occurrence: {occurrence.name}; prefix="{prefix}"\n')
@@ -80,12 +123,9 @@ class SDF:
 
         children_prefix = prefix + normalize_name(occurrence.name) + '__'
 
-        rigid_group_link = None
-        for rigid_group in occurrence.component.rigidGroups:
-            rigid_group_link = self.add_rigid_group(occurrence.component.occurrences, occurrence.transform2, rigid_group, children_prefix)
-
-        if rigid_group_link is not None:
-            occurrence.attributes.add('FusionSDF', 'link_name', rigid_group_link.name)
+        # Only top-level (root component) rigid groups define links; rigid groups
+        # nested inside sub-assemblies are intentionally ignored. The root-level
+        # groups are handled once in parse_root_component().
 
         for suboccurrence in occurrence.childOccurrences:
             self.parse_occurrence(suboccurrence, children_prefix)
@@ -96,9 +136,18 @@ class SDF:
         for joint in occurrence.component.asBuiltJoints:
             self.fusion_joints.append([joint, True, children_prefix])
 
-    def add_link(self, occurrence: adsk.fusion.Occurrence, prefix: str, rigid_group_pose: adsk.core.Matrix3D = None):
+    def add_link(self, occurrence: adsk.fusion.Occurrence, prefix: str, rigid_group_pose: adsk.core.Matrix3D = None,
+                 is_rigid_group_link: bool = False):
         link_name = prefix + normalize_name(occurrence.name)
         log(f'add_link: occurence="{occurrence.name}"; prefix="{prefix}" -> link_name={link_name}\n')
+
+        if self.progress is not None and self.progress.is_cancelled():
+            return
+
+        # Sensor mounts (sensor__*) are not links.
+        if not is_rigid_group_link and core_sensors.is_sensor_occurrence(occurrence):
+            log(f'Occurence "{occurrence.name}" is a sensor mount, skipping\n')
+            return
 
         if link_name in self.links:
             log(f'Link "{link_name}" already exists, skipping\n')
@@ -107,6 +156,12 @@ class SDF:
         if occurrence.name in self.occurrences_in_rigid_groups:
             occurrence.attributes.add('FusionSDF', 'link_name', self.occurrences_in_rigid_groups[occurrence.name])
             log(f'Occurence "{occurrence.name}" is in rigid group, skipping\n')
+            return
+
+        # In rigid-group mode, components that are not part of any rigid group
+        # are ignored (only the merged rigid-group links are emitted).
+        if self.link_mode == 'rigid_groups' and not is_rigid_group_link:
+            log(f'Occurence "{occurrence.name}" is loose (no rigid group), skipping\n')
             return
         occurrence.attributes.add('FusionSDF', 'link_name', link_name)
 
@@ -133,6 +188,11 @@ class SDF:
         link_dir_path = self.tmp_meshes_dir_path / name_to_path(link.name)
 
         for body in bodies:
+            if self.progress is not None:
+                if self.progress.is_cancelled():
+                    break
+                # One step per body so the count reflects bodies, not links.
+                self.progress.step(link_name)
             log(f'visual: {body.name}\n')
             visual = LinkElement(LinkElementType.VISUAL, link.name + '__' + normalize_name(body.name) + '_visual')
             visual.geometry = LinkGeometry(LinkGeometryType.MESH)
@@ -206,6 +266,9 @@ class SDF:
         link.inertial = LinkInertial(inertial_pose_link, physical_properties.mass, ixx, ixy, ixz, iyy, iyz, izz)
 
         self.links[link.name] = link
+        # Record the link's world transform for sensor placement (component mode;
+        # rigid-group links use the merged temp occurrence and are best-effort).
+        self.link_world[link.name] = occurrence.transform
         return link
 
     def add_joint(self, fusion_joint: adsk.fusion.Joint, as_built: bool, prefix: str):
@@ -289,11 +352,21 @@ class SDF:
         rigid_group_component = rigid_group_occurrence.component
         rigid_group_component.name = link_name
 
-        for occurrence in rigid_group.occurrences:
-            for body in occurrence.bRepBodies:
-                body.copyToComponent(rigid_group_occurrence)
+        # Merge member bodies into the temp occurrence, handling linked/external
+        # components (proxy bodies may be empty -> fall back to nativeObject).
+        # The merge only keeps the UI alive (tick); the bodies are counted once
+        # when add_link exports them below, so the count stays body-based.
+        if self.progress is not None:
+            self.progress.set_phase(f'Merging "{link_name}"')
+        merge_errors = merge_occurrence_bodies(
+            self.design.rootComponent, rigid_group_occurrence, rigid_group.occurrences,
+            progress=self.progress, step_bodies=False, phase=f'Merging "{link_name}"')
+        for err in merge_errors:
+            log(f'add_rigid_group: {err}\n')
 
-        rigid_group_link = self.add_link(rigid_group_occurrence, '', rigid_group_pose=transform2_to_pose(parent_pose))
+        if self.progress is not None:
+            self.progress.set_phase(f'Exporting "{link_name}"')
+        rigid_group_link = self.add_link(rigid_group_occurrence, '', rigid_group_pose=transform2_to_pose(parent_pose), is_rigid_group_link=True)
         rigid_group_occurrence.deleteMe()
 
         for occurrence in rigid_group.occurrences:
@@ -317,30 +390,17 @@ class SDF:
         model_node = ET.SubElement(sdf_node, 'model', {'name': self.name})
 
         if self.root_link is not None:
-            link_node = self.links[self.root_link].to_sdf_element(model_node)
-            self._add_sensors_to_link(link_node, self.root_link)
+            self.links[self.root_link].to_sdf_element(model_node)
 
         for link in self.links.values():
             if link.name == self.root_link:
                 continue
-            link_node = link.to_sdf_element(model_node)
-            self._add_sensors_to_link(link_node, link.name)
+            link.to_sdf_element(model_node)
 
         for joint in self.joints.values():
             joint.to_sdf_element(model_node)
 
         return ET.tostring(sdf_node)
-
-    def _add_sensors_to_link(self, link_node, link_name):
-        """Add sensors to a link element"""
-        if not self.sensors:
-            return
-
-        sensors_xml = core_sensors.generate_sensors_for_link_sdf(self.sensors, link_name, indent='')
-        if sensors_xml:
-            sensors_fragment = ET.fromstring(f'<root>{sensors_xml}</root>')
-            for sensor_elem in sensors_fragment:
-                link_node.append(sensor_elem)
 
     def save(self, path: Path):
         log(f'Saving SDF to "{path}"\n')
