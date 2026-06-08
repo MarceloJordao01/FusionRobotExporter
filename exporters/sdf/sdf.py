@@ -15,11 +15,11 @@ import adsk.core
 import adsk.fusion
 
 from .log import log
-from .util import normalize_name, transform2_to_pose, prettify_xml, cm_to_m, kg_cm2_to_kg_m2, world_inertia_to_com_inertia, matrix3d_to_rpy, name_to_path
+from .util import normalize_name, transform2_to_pose, prettify_xml, cm_to_m, kg_cm2_to_kg_m2, world_inertia_to_com_inertia, name_to_path
 from .link import Link, LinkElement, LinkElementType, LinkGeometry, LinkGeometryType, LinkInertial
 from .joint import Joint, JointType
 from .pose import Pose
-from ...core.mesh import export_body_to_obj
+from ...core.mesh import export_occurrence_to_stl
 from ...core.rigid_groups import merge_occurrence_bodies
 from ...core import sensors as core_sensors
 
@@ -90,16 +90,64 @@ class SDF:
                     log(f'WARNING: Multiple root links found: {root_links}\n')
                 self.root_link = next(iter(root_links))
 
-        # Add dummy base_link
-        self.links['base_link'] = Link('base_link')
-        self.links['base_link'].inertial = LinkInertial(Pose(), mass=1e-4, ixx=1e-9, ixy=0, ixz=0, iyy=1e-9, iyz=0, izz=1e-9)
-        self.joints['base_link_joint'] = Joint('base_link_joint', JointType.FIXED, None, 'base_link', self.root_link)
-        self.root_link = 'base_link'
-        # The dummy base_link sits at the world origin.
-        self.link_world['base_link'] = adsk.core.Matrix3D.create()
+        # Rename the real root link to 'base_link' (like the URDF exporter),
+        # instead of adding a separate massless dummy base_link + fixed joint.
+        # The robot's actual base component thus carries its real mass/inertia
+        # and is the model root, matching the URDF 1:1.
+        if self.root_link is not None:
+            self._rename_link(self.root_link, 'base_link')
+            self.root_link = 'base_link'
 
         # Attach sensors (sensor__* components) to their target links.
         self.attach_sensors()
+
+    def _rename_link(self, old_name: str, new_name: str):
+        """Rename a link everywhere it is referenced: the links map, its
+        visual/collision elements (names + mesh uri), the exported mesh file, the
+        joint endpoints and the sensor-frame map. Used to turn the detected root
+        link into 'base_link' without a dummy link."""
+        if old_name == new_name or old_name not in self.links:
+            return
+        if new_name in self.links:
+            log(f'_rename_link: "{new_name}" already exists, keeping "{old_name}" as root\n')
+            self.root_link = old_name
+            return
+
+        link = self.links.pop(old_name)
+        link.name = new_name
+        self.links[new_name] = link
+
+        old_uri = 'meshes/' + name_to_path(old_name) + '.stl'
+        new_uri = 'meshes/' + name_to_path(new_name) + '.stl'
+        old_path = self.tmp_dir_path / old_uri
+        new_path = self.tmp_dir_path / new_uri
+        try:
+            if old_path.exists():
+                os.makedirs(new_path.parent, exist_ok=True)
+                shutil.move(str(old_path), str(new_path))
+        except Exception as e:
+            log(f'_rename_link: mesh rename failed ({e})\n')
+
+        # Rebuild the visual/collision dicts with the new element names and uri.
+        for elements in (link.visuals, link.collisions):
+            suffix = '_visual' if elements is link.visuals else '_collision'
+            renamed = {}
+            for elem in elements.values():
+                if elem.geometry is not None and elem.geometry.mesh_uri == old_uri:
+                    elem.geometry.mesh_uri = new_uri
+                elem.name = new_name + suffix
+                renamed[elem.name] = elem
+            elements.clear()
+            elements.update(renamed)
+
+        for joint in self.joints.values():
+            if joint.parent == old_name:
+                joint.parent = new_name
+            if joint.child == old_name:
+                joint.child = new_name
+
+        if old_name in self.link_world:
+            self.link_world[new_name] = self.link_world.pop(old_name)
 
     def attach_sensors(self):
         """Place sensor__* components on their target links as <sensor> elements."""
@@ -117,8 +165,6 @@ class SDF:
             log(f'Attached sensor "{s["name"]}" ({s["type"]}) to link "{s["link"]}"\n')
 
     def parse_occurrence(self, occurrence: adsk.fusion.Occurrence, prefix: str):
-        log(f'parse_occurrence: {occurrence.name}; prefix="{prefix}"\n')
-
         self.add_link(occurrence, prefix)
 
         children_prefix = prefix + normalize_name(occurrence.name) + '__'
@@ -139,29 +185,24 @@ class SDF:
     def add_link(self, occurrence: adsk.fusion.Occurrence, prefix: str, rigid_group_pose: adsk.core.Matrix3D = None,
                  is_rigid_group_link: bool = False):
         link_name = prefix + normalize_name(occurrence.name)
-        log(f'add_link: occurence="{occurrence.name}"; prefix="{prefix}" -> link_name={link_name}\n')
 
         if self.progress is not None and self.progress.is_cancelled():
             return
 
         # Sensor mounts (sensor__*) are not links.
         if not is_rigid_group_link and core_sensors.is_sensor_occurrence(occurrence):
-            log(f'Occurence "{occurrence.name}" is a sensor mount, skipping\n')
             return
 
         if link_name in self.links:
-            log(f'Link "{link_name}" already exists, skipping\n')
             return
 
         if occurrence.name in self.occurrences_in_rigid_groups:
             occurrence.attributes.add('FusionSDF', 'link_name', self.occurrences_in_rigid_groups[occurrence.name])
-            log(f'Occurence "{occurrence.name}" is in rigid group, skipping\n')
             return
 
         # In rigid-group mode, components that are not part of any rigid group
         # are ignored (only the merged rigid-group links are emitted).
         if self.link_mode == 'rigid_groups' and not is_rigid_group_link:
-            log(f'Occurence "{occurrence.name}" is loose (no rigid group), skipping\n')
             return
         occurrence.attributes.add('FusionSDF', 'link_name', link_name)
 
@@ -185,67 +226,70 @@ class SDF:
             link.pose = rigid_group_pose
         else:
             link.pose = transform2_to_pose(occurrence.transform2)
-        link_dir_path = self.tmp_meshes_dir_path / name_to_path(link.name)
 
-        for body in bodies:
-            if self.progress is not None:
-                if self.progress.is_cancelled():
-                    break
-                # One step per body so the count reflects bodies, not links.
-                self.progress.step(link_name)
-            log(f'visual: {body.name}\n')
-            visual = LinkElement(LinkElementType.VISUAL, link.name + '__' + normalize_name(body.name) + '_visual')
-            visual.geometry = LinkGeometry(LinkGeometryType.MESH)
-            visual.geometry.mesh_uri = 'meshes/' + name_to_path(visual.name) + '.obj'
-            # Visual pose is relative to link frame
-            # Since meshes are exported in component-local coords, and link.pose = occurrence.transform2,
-            # visual should have identity pose (mesh origin = link origin)
-            visual.pose = None
-            mesh_path = self.tmp_dir_path / visual.geometry.mesh_uri
-            link.visuals[visual.name] = visual
+        # One mesh per link: export the whole occurrence as a single STL in
+        # link-local coordinates, the same mechanism the URDF exporter uses
+        # (core/mesh.py:export_stl). Visual and collision both reference this one
+        # mesh — no per-body OBJ and no oriented minimum bounding box (the OBB
+        # crashed with "invalid argument widthDirection" on degenerate bodies).
+        # Because the mesh is in component-local coords and link.pose =
+        # occurrence.transform2, the visual/collision origin coincides with the
+        # link frame (pose = None).
+        mesh_uri = 'meshes/' + name_to_path(link.name) + '.stl'
+        mesh_path = self.tmp_dir_path / mesh_uri
 
-            collision = LinkElement(LinkElementType.COLLISION, link.name + '__' + normalize_name(body.name) + '_collision')
+        visual = LinkElement(LinkElementType.VISUAL, link.name + '_visual')
+        visual.geometry = LinkGeometry(LinkGeometryType.MESH)
+        visual.geometry.mesh_uri = mesh_uri
+        visual.pose = None
+        link.visuals[visual.name] = visual
 
-            use_collision_mesh = False
-            if self.design.designType == adsk.fusion.DesignTypes.ParametricDesignType:
-                use_collision_mesh_parameter = self.design.userParameters.itemByName(collision.name + '_USE_MESH')
-                use_collision_mesh = use_collision_mesh_parameter is not None and use_collision_mesh_parameter.value
+        collision = LinkElement(LinkElementType.COLLISION, link.name + '_collision')
+        collision.geometry = LinkGeometry(LinkGeometryType.MESH)
+        collision.geometry.mesh_uri = mesh_uri
+        collision.pose = None
+        link.collisions[collision.name] = collision
 
-            if use_collision_mesh:
-                log(f'using mesh for {collision.name}\n')
-                collision.pose = visual.pose
-                collision.geometry = visual.geometry
+        if self.progress is not None:
+            # Component mode budgets one step per link mesh; rigid-group links
+            # already consumed their (body-based) budget during the merge above,
+            # so they only tick to keep the UI alive without double-counting.
+            if is_rigid_group_link:
+                self.progress.tick(link_name)
             else:
-                log(f'using oriented minimum bounding box for {collision.name}\n')
-                obb = body.orientedMinimumBoundingBox
-                obb_matrix3d = adsk.core.Matrix3D.create()
-                obb_matrix3d.setWithCoordinateSystem(obb.centerPoint, obb.heightDirection, obb.widthDirection, obb.lengthDirection)
-                # OBB centerPoint is in component-local coords, transform to link-relative
-                # Since link.pose = occurrence.transform2, we need inverse
-                obb_pose_global = Pose(cm_to_m(obb.centerPoint.asArray()), matrix3d_to_rpy(obb_matrix3d))
-                collision.pose = link.pose.inverse() * obb_pose_global
-                collision.pose.relative_to = None
-                collision.geometry = LinkGeometry(LinkGeometryType.BOX)
-                collision.geometry.size = [cm_to_m(obb.height), cm_to_m(obb.width), cm_to_m(obb.length)]
-            link.collisions[collision.name] = collision
+                self.progress.step(link_name)
 
-            os.makedirs(link_dir_path, exist_ok=True)
+        os.makedirs(mesh_path.parent, exist_ok=True)
 
-            if self.meshes_cache_dir_path:
-                mesh_cache_path = self.meshes_cache_dir_path / visual.geometry.mesh_uri.replace('meshes/', '')
-                if mesh_cache_path.exists():
-                    log(f'using cached mesh "{mesh_cache_path}"\n')
-                    shutil.copy(mesh_cache_path, mesh_path)
-                    if mesh_cache_path.with_suffix('.mtl').exists():
-                        shutil.copy(mesh_cache_path.with_suffix('.mtl'), mesh_path.with_suffix('.mtl'))
-                    continue
+        cached = False
+        if self.meshes_cache_dir_path:
+            mesh_cache_path = self.meshes_cache_dir_path / mesh_uri.replace('meshes/', '')
+            if mesh_cache_path.exists():
+                shutil.copy(mesh_cache_path, mesh_path)
+                cached = True
 
-            export_manager = self.design.exportManager
-            success, error = export_body_to_obj(export_manager, body, str(mesh_path))
+        if not cached:
+            # Exporting a merged rigid-group occurrence (thousands of bodies) is a
+            # single blocking call with no per-body progress: label it so the
+            # parked counter clearly reads as "working on this mesh", not frozen.
+            if self.progress is not None:
+                self.progress.set_phase(f'Exporting mesh "{link_name}"')
+            success, error = export_occurrence_to_stl(
+                self.design.exportManager, bodies_source, str(mesh_path))
             if not success:
                 log(f'ERROR: Failed to export mesh "{mesh_path}": {error}\n')
 
-        physical_properties = occurrence.getPhysicalProperties(adsk.fusion.CalculationAccuracy.VeryHighCalculationAccuracy)
+        # Same for the inertia: VeryHigh accuracy over a merged occurrence is the
+        # slowest single step on big assemblies; surface it as a phase so the user
+        # sees what the parked counter is doing.
+        if self.progress is not None:
+            self.progress.set_phase(f'Computing inertia "{link_name}"')
+        # Low accuracy: VeryHigh over a merged rigid-group occurrence (thousands
+        # of bodies) is the slowest single step and parks the progress counter.
+        # Low is far faster and plenty precise for Gazebo simulation. Applies to
+        # both link modes (component and rigid_groups share this path). Bump to
+        # MediumCalculationAccuracy if a link's mass/inertia ever looks off.
+        physical_properties = occurrence.getPhysicalProperties(adsk.fusion.CalculationAccuracy.LowCalculationAccuracy)
         center_of_mass = cm_to_m(physical_properties.centerOfMass.asArray())
         inertia_valid, xx, yy, zz, xy, yz, xz = physical_properties.getXYZMomentsOfInertia()
 
@@ -342,6 +386,21 @@ class SDF:
                 else:
                     joint.pose = transform2_to_pose(joint_origin.transform)
 
+        # Only emit joints that connect two distinct, real links. Rigid/as-built
+        # joints that merely assemble the sub-parts inside one component (e.g.
+        # everything inside base_link) collapse to parent == child, and a joint
+        # touching a component that never became a link points at a missing link.
+        # Both are invalid SDF and make Gazebo reject the whole model. The URDF
+        # exporter effectively drops these same internal joints — this keeps the
+        # SDF kinematic tree equivalent (only the rotor joints survive on Hermit).
+        if joint.parent == joint.child:
+            log(f'Skipping joint "{joint_name}": parent == child ("{joint.parent}")\n')
+            return
+        if joint.parent not in self.links or joint.child not in self.links:
+            missing = joint.parent if joint.parent not in self.links else joint.child
+            log(f'Skipping joint "{joint_name}": "{missing}" is not a link\n')
+            return
+
         self.joints[joint.name] = joint
 
     def add_rigid_group(self, parent_occurrences, parent_pose, rigid_group, prefix: str):
@@ -354,13 +413,16 @@ class SDF:
 
         # Merge member bodies into the temp occurrence, handling linked/external
         # components (proxy bodies may be empty -> fall back to nativeObject).
-        # The merge only keeps the UI alive (tick); the bodies are counted once
-        # when add_link exports them below, so the count stays body-based.
+        # The merge is the slow phase (one tbm.copy + BaseFeature add per body),
+        # so it owns the progress budget (step_bodies=True): the counter advances
+        # here instead of sitting at 0 until the merge finishes. add_link then
+        # only ticks while exporting these same bodies, so the count stays
+        # body-based and isn't doubled.
         if self.progress is not None:
             self.progress.set_phase(f'Merging "{link_name}"')
         merge_errors = merge_occurrence_bodies(
             self.design.rootComponent, rigid_group_occurrence, rigid_group.occurrences,
-            progress=self.progress, step_bodies=False, phase=f'Merging "{link_name}"')
+            progress=self.progress, step_bodies=True, phase=f'Merging "{link_name}"')
         for err in merge_errors:
             log(f'add_rigid_group: {err}\n')
 
@@ -372,7 +434,6 @@ class SDF:
         for occurrence in rigid_group.occurrences:
             self.occurrences_in_rigid_groups[occurrence.name] = link_name + '_1'
 
-        log(f'self.occurrences_in_rigid_groups: {self.occurrences_in_rigid_groups}\n')
         return rigid_group_link
 
     def print(self):

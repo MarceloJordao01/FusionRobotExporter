@@ -1,5 +1,6 @@
 Flask==3.0.3
-numpy==1.26.4
-# Mesh simplification (added in a later stage) will also use:
-#   trimesh==4.4.3
-#   scipy==1.13.1
+numpy>=1.26,<2
+# Mesh simplification: trimesh>=4.5 routes simplify_quadric_decimation to the
+# pure-wheel fast-simplification backend (no open3d / no system libs needed).
+trimesh>=4.5
+fast-simplification>=0.1.9

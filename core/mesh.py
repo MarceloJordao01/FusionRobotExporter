@@ -219,6 +219,37 @@ def export_obj(design: adsk.fusion.Design, save_dir: str, occurrences=None, pref
     return exported, errors
 
 
+def export_occurrence_to_stl(export_mgr, target, file_path: str) -> tuple:
+    """
+    Export a whole occurrence (or component / nativeObject) to a single STL file,
+    in its local coordinate frame. This is the same mechanism the URDF exporter
+    uses (see export_stl): one mesh per link, instead of one mesh per body.
+
+    Parameters
+    ----------
+    export_mgr: adsk.fusion.ExportManager
+    target: adsk.fusion.Occurrence | adsk.fusion.Component - geometry to export
+        (for linked components pass occurrence.nativeObject)
+    file_path: str - full path for the output .stl file
+
+    Returns
+    -------
+    tuple: (success: bool, error_message: str or None)
+    """
+    try:
+        stl_options = export_mgr.createSTLExportOptions(target, file_path)
+        stl_options.sendToPrintUtility = False
+        stl_options.isBinaryFormat = True
+        stl_options.meshRefinement = adsk.fusion.MeshRefinementSettings.MeshRefinementLow
+
+        if export_mgr.execute(stl_options):
+            return True, None
+        else:
+            return False, "export failed"
+    except Exception as e:
+        return False, str(e)
+
+
 def export_body_to_obj(export_mgr, body, file_path: str) -> tuple:
     """
     Export a single body to OBJ file

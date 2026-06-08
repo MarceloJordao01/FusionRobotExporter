@@ -22,7 +22,10 @@ class LinkGeometry:
         self.geometry_type = geometry_type
         self.mesh_uri: str = None
         self.size: List[float] = None
-        self.scale: float = 0.01  # cm to m
+        # Fusion's STL export is in millimeters, so meshes scale mm -> m (0.001),
+        # matching the URDF exporter. (The old OBJ export was in cm -> 0.01; the
+        # switch to one-STL-per-link changed the unit.)
+        self.scale: float = 0.001
 
     def __str__(self):
         type_attributes = ''

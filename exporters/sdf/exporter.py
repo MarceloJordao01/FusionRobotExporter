@@ -11,7 +11,7 @@ from pathlib import Path
 
 from .log import set_log_console, log
 from .sdf import SDF
-from ...core.progress import ProgressReporter, count_component_bodies
+from ...core.progress import ProgressReporter, count_link_occurrences
 from ...core.rigid_groups import count_rigid_groups_bodies
 
 
@@ -37,10 +37,11 @@ def export(design, save_dir, options=None):
         ui = app.userInterface
         progress = ProgressReporter(ui)
 
-        # Setup logging to Fusion console
+        # Setup logging to Fusion console. We do NOT force the Text Commands
+        # palette open: if the user already has it visible the diagnostics show
+        # up there, otherwise we stay out of the way. (Forcing it open on every
+        # run was noisy, and repainting it per body slowed large assemblies.)
         console = ui.palettes.itemById('TextCommands')
-        if console and not console.isVisible:
-            console.isVisible = True
         set_log_console(console)
 
         log('\n\n--- FusionRobotExporter (SDF) ---\n')
@@ -69,10 +70,14 @@ def export(design, save_dir, options=None):
 
         root = design.rootComponent
         if link_mode == 'rigid_groups':
+            # The body merge is the heavy phase here, so progress stays body-based.
             total = count_rigid_groups_bodies(root)
+            unit, message = 'bodies', 'Merging rigid-group bodies...'
         else:
-            total = count_component_bodies(root)
-        progress.start(total, 'Exporting SDF', 'Exporting bodies...', unit='bodies')
+            # One mesh per link (whole occurrence), like URDF -> count links.
+            total = count_link_occurrences(root)
+            unit, message = 'links', 'Exporting links...'
+        progress.start(total, 'Exporting SDF', message, unit=unit)
 
         sdf = SDF(design, meshes_cache_path, link_mode, options.get('base_link'), progress=progress)
 
